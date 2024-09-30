@@ -75,6 +75,69 @@ class ListCanvasItemDelegate(typing.Protocol):
         return  # required to avoid being recognized as abstract by mypy
 
 
+class ListCanvasItemComposer(CanvasItem.BaseComposer):
+    def __init__(self,
+                 canvas_item: CanvasItem.AbstractCanvasItem,
+                 layout_sizing: CanvasItem.Sizing,
+                 composer_cache: CanvasItem.ComposerCache,
+                 delegate: ListCanvasItemDelegate,
+                 item_height: int,
+                 drop_index: typing.Optional[int],
+                 selection: Selection.IndexedSelection,
+                 focused: bool) -> None:
+        super().__init__(canvas_item, layout_sizing, composer_cache)
+        self.__delegate = delegate
+        self.__item_height = item_height
+        self.__drop_index = drop_index
+        self.__selection = selection
+        self.__focused = focused
+
+    def _adjust_canvas_bounds(self, canvas_bounds: Geometry.IntRect) -> Geometry.IntRect:
+        item_count = self.__delegate.item_count
+        height = item_count * self.__item_height
+        return Geometry.IntRect(canvas_bounds.origin, Geometry.IntSize(height=height, width=canvas_bounds.width))
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: CanvasItem.ComposerCache) -> None:
+        canvas_size = canvas_bounds.size
+        visible_rect = Geometry.IntRect(Geometry.IntPoint(), canvas_bounds.size)
+        delegate = self.__delegate
+        item_height = self.__item_height
+        drop_index = self.__drop_index
+        selection = self.__selection
+        focused = self.__focused
+        if canvas_size.height > 0 and canvas_size.width > 0:
+            item_width = canvas_bounds.width
+
+            with drawing_context.saver():
+                drawing_context.translate(canvas_bounds.left, canvas_bounds.top)
+                items = delegate.items
+                max_index = len(items)
+                top_visible_row = visible_rect.top // item_height
+                bottom_visible_row = visible_rect.bottom // item_height
+                for index in range(top_visible_row, bottom_visible_row + 1):
+                    if 0 <= index < max_index:
+                        rect = Geometry.IntRect(origin=Geometry.IntPoint(y=index * item_height, x=0),
+                                                size=Geometry.IntSize(width=item_width, height=item_height))
+                        if rect.intersects_rect(visible_rect):
+                            is_selected = selection.contains(index)
+                            if is_selected:
+                                with drawing_context.saver():
+                                    drawing_context.begin_path()
+                                    drawing_context.rect(rect.left, rect.top, rect.width, rect.height)
+                                    drawing_context.fill_style = "#3875D6" if focused else "#DDD"
+                                    drawing_context.fill()
+                            delegate.paint_item(drawing_context, items[index], rect, is_selected)
+                            if index == drop_index:
+                                with drawing_context.saver():
+                                    drop_border_width = 2.5
+                                    rect_in = rect.to_float_rect().inset(drop_border_width / 2, drop_border_width / 2).to_int_rect()
+                                    drawing_context.begin_path()
+                                    drawing_context.rect(rect_in.left, rect_in.top, rect_in.width, rect_in.height)
+                                    drawing_context.line_width = drop_border_width
+                                    drawing_context.stroke_style = "rgba(56, 117, 214, 0.8)"
+                                    drawing_context.stroke()
+
+
 class ListCanvasItem(CanvasItem.AbstractCanvasItem):
     """
     Takes a delegate that supports the following properties, methods, and optional methods:
@@ -121,16 +184,6 @@ class ListCanvasItem(CanvasItem.AbstractCanvasItem):
     def detach_delegate(self) -> None:
         self.__delegate = None
 
-    def _get_autosizer(self) -> typing.Callable[[typing.Optional[Geometry.IntSize]], typing.Optional[Geometry.IntSize]]:
-        delegate = self.__delegate
-        item_count = delegate.item_count if delegate else 0
-        height = item_count * self.__item_height
-
-        def calculate_size(canvas_size: typing.Optional[Geometry.IntSize]) -> typing.Optional[Geometry.IntSize]:
-            return Geometry.IntSize(height=height, width=canvas_size.width) if canvas_size else None
-
-        return calculate_size
-
     def handle_tool_tip(self, x: int, y: int, gx: int, gy: int) -> bool:
         delegate = self.__delegate
         max_index = delegate.item_count if delegate else 0
@@ -157,45 +210,9 @@ class ListCanvasItem(CanvasItem.AbstractCanvasItem):
                                     size=Geometry.IntSize(width=item_width, height=item_height))
         return Geometry.IntRect.empty_rect()
 
-    def _repaint_visible(self, drawing_context: DrawingContext.DrawingContext, visible_rect: Geometry.IntRect) -> None:
-        canvas_bounds = self.canvas_bounds
-        delegate = self.__delegate
-        if delegate and canvas_bounds:
-            item_width = canvas_bounds.width
-            item_height = self.__item_height
-
-            with drawing_context.saver():
-                items = delegate.items
-                max_index = len(items)
-                top_visible_row = visible_rect.top // item_height
-                bottom_visible_row = visible_rect.bottom // item_height
-                for index in range(top_visible_row, bottom_visible_row + 1):
-                    if 0 <= index < max_index:
-                        rect = Geometry.IntRect(origin=Geometry.IntPoint(y=index * item_height, x=0),
-                                                size=Geometry.IntSize(width=item_width, height=item_height))
-                        if rect.intersects_rect(visible_rect):
-                            is_selected = self.__selection.contains(index)
-                            if is_selected:
-                                with drawing_context.saver():
-                                    drawing_context.begin_path()
-                                    drawing_context.rect(rect.left, rect.top, rect.width, rect.height)
-                                    drawing_context.fill_style = "#3875D6" if self.focused else "#DDD"
-                                    drawing_context.fill()
-                            delegate.paint_item(drawing_context, items[index], rect, is_selected)
-                            if index == self.__drop_index:
-                                with drawing_context.saver():
-                                    drop_border_width = 2.5
-                                    rect_in = rect.to_float_rect().inset(drop_border_width / 2, drop_border_width / 2).to_int_rect()
-                                    drawing_context.begin_path()
-                                    drawing_context.rect(rect_in.left, rect_in.top, rect_in.width, rect_in.height)
-                                    drawing_context.line_width = drop_border_width
-                                    drawing_context.stroke_style = "rgba(56, 117, 214, 0.8)"
-                                    drawing_context.stroke()
-
-    def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        canvas_bounds = self.canvas_bounds
-        if canvas_bounds:
-            self._repaint_visible(drawing_context, canvas_bounds)
+    def _get_composer(self, composer_cache: CanvasItem.ComposerCache) -> typing.Optional[CanvasItem.BaseComposer]:
+        assert self.__delegate
+        return ListCanvasItemComposer(self, self.layout_sizing, composer_cache, self.__delegate, self.__item_height, self.__drop_index, self.__selection, self.focused)
 
     def context_menu_event(self, x: int, y: int, gx: int, gy: int) -> bool:
         delegate = self.__delegate

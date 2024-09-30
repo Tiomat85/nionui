@@ -16,12 +16,24 @@ from nion.ui import UserInterface
 from nion.utils import Geometry
 
 
+class TestCanvasItemComposer(CanvasItem.BaseComposer):
+    def __init__(self, canvas_item: CanvasItem.AbstractCanvasItem, layout_sizing: CanvasItem.Sizing,
+                 cache: CanvasItem.ComposerCache, repaint_delay: float = 0.0) -> None:
+        super().__init__(canvas_item, layout_sizing, cache)
+        self.__repaint_delay = repaint_delay
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect,
+                 composer_cache: CanvasItem.ComposerCache) -> None:
+        time.sleep(self.__repaint_delay)
+
+
 class TestCanvasItem(CanvasItem.AbstractCanvasItem):
     def __init__(self) -> None:
         super(TestCanvasItem, self).__init__()
         self.wants_mouse_events = True
         self._mouse_released = False
         self.key: typing.Optional[UserInterface.Key] = None
+        self.repaint_delay = 0.0
 
     def mouse_pressed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
         return True
@@ -37,6 +49,56 @@ class TestCanvasItem(CanvasItem.AbstractCanvasItem):
     def key_released(self, key: UserInterface.Key) -> bool:
         self.key_r = key
         return True
+
+    def _get_composer(self, composer_cache: CanvasItem.ComposerCache) -> typing.Optional[CanvasItem.BaseComposer]:
+        return TestCanvasItemComposer(self, self.layout_sizing, composer_cache, self.repaint_delay)
+
+
+class TestCanvasItemComposition(CanvasItem.CanvasItemComposition):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mouse_inside = False
+        self.mouse_pos: typing.Optional[Geometry.IntPoint] = None
+        self.mouse_pressed_pos: typing.Optional[Geometry.IntPoint] = None
+        self.drag_inside = False
+        self.drag_pos: typing.Optional[Geometry.IntPoint] = None
+
+    def mouse_entered(self) -> bool:
+        self.mouse_inside = True
+        return True
+
+    def mouse_exited(self) -> bool:
+        self.mouse_inside = False
+        self.mouse_pos = None
+        return True
+
+    def mouse_position_changed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
+        self.mouse_pos = Geometry.IntPoint(y=y, x=x)
+        return True
+
+    def mouse_pressed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
+        self.mouse_pressed_pos = Geometry.IntPoint(y=y, x=x)
+        return True
+
+    def mouse_released(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
+        self.mouse_pressed_pos = None
+        return True
+
+    def drag_enter(self, mime_data: UserInterface.MimeData) -> str:
+        self.drag_inside = True
+        return "ignore"
+
+    def drag_leave(self) -> str:
+        self.drag_inside = False
+        self.drag_pos = None
+        return "ignore"
+
+    def drag_move(self, mime_data: UserInterface.MimeData, x: int, y: int) -> str:
+        self.drag_pos = Geometry.IntPoint(y=y, x=x)
+        return "ignore"
+
+    def drop(self, mime_data: UserInterface.MimeData, x: int, y: int) -> str:
+        return "copy"
 
 
 class TestCanvasItemClass(unittest.TestCase):
@@ -150,6 +212,7 @@ class TestCanvasItemClass(unittest.TestCase):
         assert canvas_origin
         self.assertEqual(240, canvas_origin.y)
         cc_canvas.update_sizing(child_canvas.sizing.with_maximum_height(8))
+        canvas_item.update_layout(Geometry.IntPoint(x=0, y=0), Geometry.IntSize(width=640, height=480))
         canvas_origin = child_canvas.canvas_origin
         assert canvas_origin
         self.assertEqual(472, canvas_origin.y)
@@ -751,60 +814,6 @@ class TestCanvasItemClass(unittest.TestCase):
         self.assertEqual(column.canvas_items[1].canvas_rect, Geometry.IntRect.from_tlbr(20, 0, 80, 30))
         self.assertEqual(column.canvas_items[2].canvas_rect, Geometry.IntRect.from_tlbr(80, 15, 100, 15))
 
-    class TestCanvasItem(CanvasItem.CanvasItemComposition):
-
-        def __init__(self) -> None:
-            super(TestCanvasItemClass.TestCanvasItem, self).__init__()
-            self.mouse_inside = False
-            self.mouse_pos: typing.Optional[Geometry.IntPoint] = None
-            self.mouse_pressed_pos: typing.Optional[Geometry.IntPoint] = None
-            self.drag_inside = False
-            self.drag_pos: typing.Optional[Geometry.IntPoint] = None
-            self.repaint_count = 0
-            self.repaint_delay = 0.0
-
-        def mouse_entered(self) -> bool:
-            self.mouse_inside = True
-            return True
-
-        def mouse_exited(self) -> bool:
-            self.mouse_inside = False
-            self.mouse_pos = None
-            return True
-
-        def mouse_position_changed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-            self.mouse_pos = Geometry.IntPoint(y=y, x=x)
-            return True
-
-        def mouse_pressed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-            self.mouse_pressed_pos = Geometry.IntPoint(y=y, x=x)
-            return True
-
-        def mouse_released(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-            self.mouse_pressed_pos = None
-            return True
-
-        def drag_enter(self, mime_data: UserInterface.MimeData) -> str:
-            self.drag_inside = True
-            return "ignore"
-
-        def drag_leave(self) -> str:
-            self.drag_inside = False
-            self.drag_pos = None
-            return "ignore"
-
-        def drag_move(self, mime_data: UserInterface.MimeData, x: int, y: int) -> str:
-            self.drag_pos = Geometry.IntPoint(y=y, x=x)
-            return "ignore"
-
-        def drop(self, mime_data: UserInterface.MimeData, x: int, y: int) -> str:
-            return "copy"
-
-        def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-            self.repaint_count += 1
-            time.sleep(self.repaint_delay)
-            super()._repaint(drawing_context)
-
     def test_mouse_tracking_on_topmost_non_overlapped_canvas_item(self) -> None:
         ui = TestUI.UserInterface()
         # test row layout
@@ -812,7 +821,7 @@ class TestCanvasItemClass(unittest.TestCase):
         with contextlib.closing(canvas_widget):
             canvas_item = canvas_widget.canvas_item
             container_canvas_item = CanvasItem.CanvasItemComposition()
-            test_canvas_item = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item = TestCanvasItemComposition()
             test_canvas_item.wants_mouse_events = True
             container_canvas_item.add_canvas_item(test_canvas_item)
             canvas_item.add_canvas_item(container_canvas_item)
@@ -837,7 +846,7 @@ class TestCanvasItemClass(unittest.TestCase):
         canvas_widget = ui.create_canvas_widget()
         with contextlib.closing(canvas_widget):
             canvas_item = canvas_widget.canvas_item
-            test_canvas_item = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item = TestCanvasItemComposition()
             test_canvas_item.wants_mouse_events = True
             test_canvas_item.add_canvas_item(CanvasItem.BackgroundCanvasItem("#00F"))
             canvas_item.add_canvas_item(test_canvas_item)
@@ -864,7 +873,7 @@ class TestCanvasItemClass(unittest.TestCase):
         canvas_widget = ui.create_canvas_widget()
         with contextlib.closing(canvas_widget):
             canvas_item = canvas_widget.canvas_item
-            test_canvas_item = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item = TestCanvasItemComposition()
             test_canvas_item.wants_mouse_events = True
             test_canvas_item.add_canvas_item(CanvasItem.BackgroundCanvasItem("#00F"))
             canvas_item.add_canvas_item(test_canvas_item)
@@ -890,7 +899,7 @@ class TestCanvasItemClass(unittest.TestCase):
         with contextlib.closing(canvas_widget):
             canvas_item = canvas_widget.canvas_item
             container_canvas_item = CanvasItem.CanvasItemComposition()
-            test_canvas_item = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item = TestCanvasItemComposition()
             test_canvas_item.wants_drag_events = True
             container_canvas_item.add_canvas_item(test_canvas_item)
             canvas_item.add_canvas_item(container_canvas_item)
@@ -916,12 +925,12 @@ class TestCanvasItemClass(unittest.TestCase):
             canvas_item = canvas_widget.canvas_item
             container_canvas_item = CanvasItem.CanvasItemComposition()
             container_canvas_item.layout = CanvasItem.CanvasItemRowLayout()
-            test_canvas_item1 = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item1 = TestCanvasItemComposition()
             test_canvas_item1.wants_mouse_events = True
             test_canvas_item1.wants_drag_events = True
             container_canvas_item.add_canvas_item(test_canvas_item1)
             canvas_item.add_canvas_item(container_canvas_item)
-            test_canvas_item2 = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item2 = TestCanvasItemComposition()
             test_canvas_item2.wants_mouse_events = True
             container_canvas_item.add_canvas_item(test_canvas_item2)
             canvas_item.update_layout(Geometry.IntPoint(x=0, y=0), Geometry.IntSize(width=640, height=480))
@@ -962,12 +971,12 @@ class TestCanvasItemClass(unittest.TestCase):
             canvas_item = canvas_widget.canvas_item
             container_canvas_item = CanvasItem.CanvasItemComposition()
             container_canvas_item.layout = CanvasItem.CanvasItemRowLayout()
-            test_canvas_item1 = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item1 = TestCanvasItemComposition()
             test_canvas_item1.wants_mouse_events = True
             test_canvas_item1.wants_drag_events = True
             container_canvas_item.add_canvas_item(test_canvas_item1)
             canvas_item.add_canvas_item(container_canvas_item)
-            test_canvas_item2 = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item2 = TestCanvasItemComposition()
             test_canvas_item2.wants_mouse_events = True
             container_canvas_item.add_canvas_item(test_canvas_item2)
             canvas_item.update_layout(Geometry.IntPoint(x=0, y=0), Geometry.IntSize(width=640, height=480))
@@ -1657,7 +1666,7 @@ class TestCanvasItemClass(unittest.TestCase):
         with contextlib.closing(outer_layer):
             inner_composition = CanvasItem.CanvasItemComposition()
             inner_layer = CanvasItem.LayerCanvasItem()
-            test_canvas_item = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item = TestCanvasItem()
             outer_layer.add_canvas_item(inner_composition)
             inner_composition.add_canvas_item(inner_layer)
             inner_layer.add_canvas_item(test_canvas_item)
@@ -1675,13 +1684,13 @@ class TestCanvasItemClass(unittest.TestCase):
         with contextlib.closing(outer_layer):
             inner_composition = CanvasItem.CanvasItemComposition()
             inner_layer = CanvasItem.LayerCanvasItem()
-            test_canvas_item = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item = TestCanvasItem()
             outer_layer.add_canvas_item(inner_composition)
             inner_composition.add_canvas_item(inner_layer)
             inner_layer.add_canvas_item(test_canvas_item)
-            # update the outer layer with the initial size
-            outer_layer.update_layout(Geometry.IntPoint(), Geometry.IntSize(width=640, height=480))
-            # sleep a short time to allow thread to run
+            # update the outer layer with the initial size. this will run immediately.
+            outer_layer.update_layout_immediate(Geometry.IntPoint(), Geometry.IntSize(width=640, height=480))
+            # wait for any thread repainting to finish
             time.sleep(0.05)
             # save the repaint counts
             outer_layer_repaint_count = outer_layer._repaint_count
@@ -1689,7 +1698,7 @@ class TestCanvasItemClass(unittest.TestCase):
             test_canvas_item_repaint_count = test_canvas_item._repaint_count
             # update the canvas item and make sure everyone repaints
             test_canvas_item.update()
-            # sleep a short time to allow thread to run
+            # wait for any thread repainting to finish
             time.sleep(0.05)
             # check the repaint counts were all incremented
             self.assertEqual(outer_layer_repaint_count + 1, outer_layer._repaint_count)
@@ -1700,7 +1709,7 @@ class TestCanvasItemClass(unittest.TestCase):
         CanvasItem._threaded_rendering_enabled = True
         outer_layer = CanvasItem.LayerCanvasItem()
         with contextlib.closing(outer_layer):
-            test_canvas_item = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item = TestCanvasItem()
             test_canvas_item.repaint_delay = 0.05
             outer_layer.add_canvas_item(test_canvas_item)
             # update the outer layer with the initial size
@@ -1709,7 +1718,7 @@ class TestCanvasItemClass(unittest.TestCase):
             time.sleep(test_canvas_item.repaint_delay / 2)
             test_canvas_item.update()
             time.sleep(test_canvas_item.repaint_delay * 2)
-            self.assertEqual(test_canvas_item.repaint_count, 2)
+            self.assertEqual(test_canvas_item._repaint_count, 2)
 
     def test_parent_canvas_item_triggers_only_one_layout_for_each_descendent(self) -> None:
         CanvasItem._threaded_rendering_enabled = True
@@ -1717,19 +1726,21 @@ class TestCanvasItemClass(unittest.TestCase):
         with contextlib.closing(outer_layer):
             inner_composition = CanvasItem.CanvasItemComposition()
             inner_layer = CanvasItem.LayerCanvasItem()
-            test_canvas_item = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item = TestCanvasItem()
             outer_layer.add_canvas_item(inner_composition)
             inner_composition.add_canvas_item(inner_layer)
             inner_layer.add_canvas_item(test_canvas_item)
             # update the outer layer with the initial size
-            outer_layer.update_layout(Geometry.IntPoint(), Geometry.IntSize(width=640, height=480))
+            outer_layer.update_layout_immediate(Geometry.IntPoint(), Geometry.IntSize(width=640, height=480))
+            # wait for any thread repainting to finish
+            time.sleep(0.05)
             # save the layout counts
             outer_layer_layout_count = outer_layer._layout_count
             inner_composition_layout_count = inner_composition._layout_count
             inner_layer_layout_count = inner_layer._layout_count
             test_canvas_item_layout_count = test_canvas_item._layout_count
             # update the canvas item and make sure all descendents update layout once
-            outer_layer.update_layout(Geometry.IntPoint(), Geometry.IntSize(width=720, height=540))
+            outer_layer.update_layout_immediate(Geometry.IntPoint(), Geometry.IntSize(width=720, height=540))
             # check the repaint counts were all incremented
             self.assertEqual(outer_layer_layout_count + 1, outer_layer._layout_count)
             self.assertEqual(inner_composition_layout_count + 1, inner_composition._layout_count)
@@ -1743,16 +1754,18 @@ class TestCanvasItemClass(unittest.TestCase):
         with contextlib.closing(outer_layer):
             inner_composition = CanvasItem.CanvasItemComposition()
             inner_composition.layout = CanvasItem.CanvasItemRowLayout()
-            test_canvas_item1 = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item1 = TestCanvasItem()
             inner_composition.add_canvas_item(test_canvas_item1)
             inner_composition2 = CanvasItem.CanvasItemComposition()
             inner_composition2.layout = CanvasItem.CanvasItemRowLayout()
-            test_canvas_item2 = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item2 = TestCanvasItem()
             inner_composition2.add_canvas_item(test_canvas_item2)
             outer_layer.add_canvas_item(inner_composition)
             outer_layer.add_canvas_item(inner_composition2)
             # update the outer layer with the initial size
-            outer_layer.update_layout(Geometry.IntPoint(), Geometry.IntSize(width=640, height=480))
+            outer_layer.update_layout_immediate(Geometry.IntPoint(), Geometry.IntSize(width=640, height=480))
+            # wait for any thread repainting to finish
+            time.sleep(0.05)
             # save the layout counts
             outer_layer_layout_count = outer_layer._layout_count
             inner_composition_layout_count = inner_composition._layout_count
@@ -1760,8 +1773,11 @@ class TestCanvasItemClass(unittest.TestCase):
             test_canvas_item1_layout_count = test_canvas_item1._layout_count
             test_canvas_item2_layout_count = test_canvas_item2._layout_count
             # add a row and ensure only siblings are layed out
-            test_canvas_item1a = TestCanvasItemClass.TestCanvasItem()
+            test_canvas_item1a = TestCanvasItem()
             inner_composition.add_canvas_item(test_canvas_item1a)
+            outer_layer.update_layout_immediate(Geometry.IntPoint(), Geometry.IntSize(width=640, height=480))
+            # wait for any thread repainting to finish
+            time.sleep(0.05)
             # check the repaint counts were all incremented
             self.assertEqual(outer_layer_layout_count, outer_layer._layout_count)
             self.assertEqual(inner_composition_layout_count, inner_composition._layout_count)

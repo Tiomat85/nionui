@@ -1,11 +1,110 @@
 """
-    CanvasItem module contains classes related to canvas items.
+CanvasItem module contains classes related to canvas items.
+
+OVERVIEW
+
+User interface consists of high-level widgets, usually provided by the host application, and low-level canvas items. 
+The canvas items are designed to be lightweight and efficient, and they are used for graphics and other visual 
+elements not provided by widgets.
+
+Canvas items are typically created and put into a container to form a tree of canvas items. Canvas items fall into 
+two main categories: composite and non-composite. Composite canvas items are containers for other canvas items, 
+while non-composite canvas items are the leaf nodes of the canvas item tree. Both are derived from the 
+AbstractCanvasItem base class.
+
+The root canvas item in the tree is usually attached to a high level CanvasWidget and receives mouse and keyboard
+events via that widget and passes them down through the tree. The root canvas item is also used for sending rendering
+drawing commands to the host via the canvas widget.
+
+The root canvas item is a subclass of a special type of canvas item called a layer, which executes layout and 
+painting on a thread. The canvas item tree can be configured so that the root canvas item is composed of layers that
+draw directly to the canvas widget from their thread; or it can be configured so that the root canvas draws to the 
+canvas widget. When comprised of layers, the root canvas item can be split into drawing disjoint areas,
+called sections, each in its own thread for performance.
+
+Each layer canvas item also manages a thread for rendering and is responsible for sending drawing commands to the 
+CanvasWidget. Layers acting as sections use the CanvasWidget.draw_section method; whereas root canvas item uses the 
+CanvasWidget.draw method.
+
+Each canvas item is responsible for maintaining its state, including visibility, sizing preferences, visual properties,
+and contents. Each canvas item is also responsible for supplying a composer object representing the canvas item for
+layout and drawing.
+
+The composer object represents a snapshot of its canvas item and handles layout and rendering. It is immutable and 
+safe to use in threads. Like the canvas items, the composers will be organized into a composer tree that will match 
+the hierarchy of the canvas item tree.
+
+When a canvas item needs an update, it will mark itself as needing a new composer and then request a repaint from its 
+container. When it moves up the tree to a layer container, it will trigger a repaint on the layer's thread. The 
+thread will ask for its layer's composer, layout the composer, and paint the composer. When the painting is finished, 
+the thread will send the drawing commands to the CanvasWidget.
+
+An update can be triggered by layout changes, sizing preference changes, property changes, content changes, and more.
+
+Layout occurs on a thread using composers. However, sometimes the canvas item needs to know about its layout,
+such as for hit testing. So whenever the layout is painted, the painting thread will inform the canvas item of its
+latest position and size via the _update_layout_from_composer method.
+
+CANVAS ITEMS
+
+- AbstractCanvasItem
+- CanvasItemComposition (see COMPOSITE CANVAS ITEMS and LAYOUTS below)
+- DrawingContextCanvasItem
+- SliderCanvasItem
+- ScrollBarCanvasItem
+- BackgroundCanvasItem
+- CellCanvasItem (see CELL STYLE CANVAS ITEMS below)
+- CheckBoxCanvasItem
+- EmptyCanvasItem
+- DrawCanvasItem
+- DividerCanvasItem
+- ProgressBarCanvasItem
+- TimestampCanvasItem
+
+COMPOSITE CANVAS ITEMS
+
+- LayerCanvasItem
+- RootCanvasItem (special type of LayerCanvasItem)
+- ScrollAreaCanvasItem
+- SplitterCanvasItem
+
+LAYOUTS
+
+- CanvasItemAbstractLayout
+- CanvasItemLayout (overlapping)
+- CanvasItemColumnLayout, CanvasItemRowLayout
+- CanvasItemGridLayout
+- CanvasItemScrollAreaLayout (used only for ScrollAreaCanvasItem)
+- CanvasItemSplitterLayout (used only for SplitterCanvasItem)
+
+CELL STYLE CANVAS ITEMS
+
+- TextCanvasItem
+- TwistDownCanvasItem
+- BitmapCanvasItem
+- StaticTextCanvasItem
+
+GLOSSARY
+
+"widget" is a high level UI element supplied by the host application.
+
+"canvas item" is a low level UI element supplied by the UI library.
+
+"composer" is an immutable object representing a canvas item for layout and drawing.
+
+"layout" is the process of determining the size and position of each canvas item in the tree.
+
+"painting" is the process of creating a list of drawing commands representing the canvas items.
+
+"rendering" is the process of turning the drawing commands into a bitmap.
+
+"blitting" is the process of copying the bitmap to the screen.
+
 """
 from __future__ import annotations
 
 # standard libraries
 import abc
-import collections
 import concurrent.futures
 import contextlib
 import copy
@@ -13,13 +112,13 @@ import dataclasses
 import datetime
 import enum
 import functools
-import time
-
 import imageio.v3 as imageio
 import logging
 import operator
+import random
 import sys
 import threading
+import time
 import types
 import typing
 import warnings
@@ -460,6 +559,27 @@ class Sizing:
             return int(min(self.maximum_height, maximum_height))
         return int(maximum_height)
 
+    def get_preferred_width(self) -> typing.Union[int, float]:
+        if self.preferred_width:
+            return self.preferred_width
+        if self.maximum_width:
+            return self.maximum_width
+        if self.minimum_width:
+            return self.minimum_width
+        return 0
+
+    def get_preferred_height(self) -> typing.Union[int, float]:
+        if self.preferred_height:
+            return self.preferred_height
+        if self.maximum_height:
+            return self.maximum_height
+        if self.minimum_height:
+            return self.minimum_height
+        return 0
+
+    def get_preferred_size(self) -> Geometry.IntSize:
+        return Geometry.IntSize(int(self.get_preferred_height()), int(self.get_preferred_width()))
+
 
 class KeyboardModifiers:
     def __init__(self, shift: bool = False, control: bool = False, alt: bool = False, meta: bool = False, keypad: bool = False) -> None:
@@ -532,8 +652,133 @@ class KeyboardModifiers:
         return self.control
 
 
-def visible_canvas_item(canvas_item: typing.Optional[LayoutItem]) -> typing.Optional[LayoutItem]:
+def visible_layout_sizing_item(canvas_item: typing.Optional[LayoutSizingItem]) -> typing.Optional[LayoutSizingItem]:
     return canvas_item if canvas_item and canvas_item.is_visible else None
+
+
+def visible_layout_item(canvas_item: typing.Optional[LayoutItem]) -> typing.Optional[LayoutItem]:
+    return canvas_item if canvas_item and canvas_item.is_visible else None
+
+
+class ComposerCacheItem(typing.Protocol):
+    def key(self) -> typing.Any: ...
+    def calculate(self) -> typing.Any: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheValue:
+    value: typing.Any
+
+
+class ComposerCache:
+    def __init__(self) -> None:
+        self.__cache = dict[typing.Any, weakref.ReferenceType[CacheValue]]()
+
+    def get_cache_value(self, cache_item: ComposerCacheItem) -> CacheValue:
+        cache_item_key = cache_item.key()
+        cache_value_ref = self.__cache.get(cache_item_key)
+        cache_value = cache_value_ref() if cache_value_ref else None
+        if cache_value is None:
+            value = cache_item.calculate()
+            cache_value = CacheValue(value)
+            self.__cache[cache_item_key] = weakref.ref(cache_value)
+
+            def finalize(cache: dict[typing.Any, weakref.ReferenceType[CacheValue]], cache_item_key: typing.Any) -> None:
+                cache.pop(cache_item_key, None)
+
+            weakref.finalize(cache_value, finalize, self.__cache, cache_item_key)
+        return cache_value
+
+
+class BaseComposer:
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, cache: ComposerCache) -> None:
+        self.__canvas_item_ref = weakref.ref(canvas_item)
+        self.__layout_sizing = layout_sizing
+        self.__drawing_context: typing.Optional[DrawingContext.DrawingContext] = None
+        self.__canvas_bounds: typing.Optional[Geometry.IntRect] = None
+        self.__cache = cache
+
+    def repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect) -> None:
+        # if layout is changed, update it. it may clear the drawing context.
+        self.update_layout(canvas_bounds.origin, canvas_bounds.size)
+        existing_draw_context = self.__drawing_context
+        if not existing_draw_context:
+            existing_draw_context = DrawingContext.DrawingContext()
+            try:
+                self._repaint(existing_draw_context, canvas_bounds, self.__cache)
+                self._draw_unique_marker(existing_draw_context, canvas_bounds)
+            except Exception as e:
+                logging.exception(f"Error in composer repaint {type(self)} {e}")
+            self._update_repaint_count()
+        drawing_context.add(existing_draw_context)
+        self.__drawing_context = existing_draw_context
+
+    def _update_repaint_count(self) -> None:
+        # this is overridable to allow class DrawingContextCanvasItemComposer to accurately update the repaint count.
+        canvas_item = self.__canvas_item_ref()
+        if canvas_item:
+            canvas_item._update_repaint_count_from_composer()
+
+    # used for debugging
+    def _draw_unique_marker(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect) -> None:
+        MARKER_SIZE: typing.Final[int] = 3
+        canvas_item = self.__canvas_item_ref()
+        draw_unique_marker = (canvas_item and canvas_item._draw_unique_marker) or _g_draw_unique_marker
+        if draw_unique_marker and canvas_bounds.width > MARKER_SIZE * 2 and canvas_bounds.height > MARKER_SIZE * 2:
+            colors = list(Color.svg_color_map.values())
+            for oy in (0, MARKER_SIZE):
+                for ox in (0, MARKER_SIZE):
+                    with drawing_context.saver():
+                        drawing_context.begin_path()
+                        drawing_context.rect(ox, oy, MARKER_SIZE, MARKER_SIZE)
+                        drawing_context.fill_style = random.choice(colors)
+                        drawing_context.fill()
+
+    @property
+    def _canvas_item(self) -> AbstractCanvasItem:
+        canvas_item = self.__canvas_item_ref()
+        assert canvas_item
+        return canvas_item
+
+    @property
+    def _canvas_bounds(self) -> Geometry.IntRect:
+        assert self.__canvas_bounds
+        return self.__canvas_bounds
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        raise NotImplementedError()
+
+    @property
+    def is_visible(self) -> bool:
+        return True
+
+    @property
+    def layout_sizing(self) -> Sizing:
+        return self.__layout_sizing
+
+    @property
+    def _has_layout(self) -> bool:
+        return self.__canvas_bounds is not None
+
+    def update_layout(self, canvas_origin: typing.Optional[Geometry.IntPoint], canvas_size: typing.Optional[Geometry.IntSize]) -> None:
+        canvas_bounds = Geometry.IntRect(canvas_origin or (0, 0), canvas_size or (0, 0))
+        canvas_bounds = self._adjust_canvas_bounds(canvas_bounds)
+        if self.__canvas_bounds != canvas_bounds:
+            self.__canvas_bounds = canvas_bounds
+            self.__drawing_context = None
+            self._update_layout(canvas_bounds)
+        canvas_item = self.__canvas_item_ref()
+        if canvas_item:
+            canvas_item._update_layout_from_composer(canvas_bounds)
+
+    def _adjust_canvas_bounds(self, canvas_bounds: Geometry.IntRect) -> Geometry.IntRect:
+        return canvas_bounds
+
+    def _update_layout(self, canvas_bounds: Geometry.IntRect) -> None:
+        pass
+
+
+_g_draw_unique_marker = False
 
 
 class AbstractCanvasItem:
@@ -572,19 +817,18 @@ class AbstractCanvasItem:
     Update is the mechanism by which the container is notified that one of its child canvas items needs updating.
     The update message will ultimately end up at the root container at which point the root container will trigger a
     repaint on a thread.
-
-    Subclasses should override _repaint or _repaint_visible to implement drawing. Drawing should take place within the
-    canvas bounds.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, cache: typing.Optional[ComposerCache] = None) -> None:
         super().__init__()
+        self.__composer_lock = threading.RLock()
+        self.__composer: typing.Optional[BaseComposer] = None
+        self.__cache = cache or ComposerCache()
         self.__container: typing.Optional[CanvasItemComposition] = None
         self._canvas_size_stream = Stream.ValueStream[Geometry.IntSize]()
         self._canvas_origin_stream = Stream.ValueStream[Geometry.IntPoint]()
         self.__sizing = Sizing(SizingData())
-        self.__last_layout_sizing: typing.Optional[Sizing] = None
-        self.__last_repaint_canvas_rect: typing.Optional[Geometry.IntRect] = None
+        self.__layout_count = 0
         self.__focused = False
         self.__focusable = False
         self.wants_mouse_events = False
@@ -597,13 +841,14 @@ class AbstractCanvasItem:
         self.__visible = True
         self.__enabled = True
         self.__thread = threading.current_thread()
-        self.__pending_update = True
-        self.__repaint_drawing_context: typing.Optional[DrawingContext.DrawingContext] = None
+        self.__update_lock = threading.RLock()
+        self.__update_level = 0  # used for deferred updating
         # stats for testing
         self._update_count = 0
         self._repaint_count = 0
         self._layout_count = 0
         self.is_root_opaque = False
+        self._draw_unique_marker = False
 
     def close(self) -> None:
         """ Close the canvas object. """
@@ -848,14 +1093,6 @@ class AbstractCanvasItem:
         """Subclasses may override to know when removed from a container."""
         pass
 
-    def prepare_render(self) -> None:
-        """Subclasses may override to prepare for layout and repaint. DEPRECATED see _prepare_render."""
-        pass
-
-    def _prepare_render(self) -> None:
-        """Subclasses may override to prepare for layout and repaint."""
-        pass
-
     def update_layout(self, canvas_origin: typing.Optional[Geometry.IntPoint], canvas_size: typing.Optional[Geometry.IntSize]) -> None:
         """Update the layout with a new canvas_origin and canvas_size. Update child layouts, too.
 
@@ -863,62 +1100,22 @@ class AbstractCanvasItem:
 
         The canvas_origin and canvas_size properties are valid after calling this method and _has_layout is True.
         """
+        self.update_layout_using_composer(Geometry.IntRect(canvas_origin or (0, 0), canvas_size or (0, 0)))
 
-        did_layout_change = False
+    def update_layout_immediate(self, canvas_origin: typing.Optional[Geometry.IntPoint], canvas_size: typing.Optional[Geometry.IntSize]) -> None:
+        """Update the layout with a new canvas_origin and canvas_size. Update child layouts, too.
 
-        # update canvas origin and canvas size.
-        if self.canvas_origin != canvas_origin:
-            did_layout_change = True
-            self._set_canvas_origin(canvas_origin)
-        canvas_auto_size = self._get_autosizer()(canvas_size)
-        if self.canvas_size != canvas_auto_size:
-            did_layout_change = True
-            self._set_canvas_size(canvas_auto_size)
+        canvas_origin and canvas_size are the external bounds.
 
-        # always update child layouts, which will only be updated if they have changed.
-        self._update_child_layouts(self.canvas_size)
-
-        # update layout_count, used for testing.
-        self._layout_count += 1 if did_layout_change else 0
-
-    def _get_autosizer(self) -> typing.Callable[[typing.Optional[Geometry.IntSize]], typing.Optional[Geometry.IntSize]]:
-        return lambda c: c
-
-    def _update_child_layouts(self, canvas_size: typing.Optional[Geometry.IntSize]) -> None:
-        """Update child layouts. Container subclasses should override.
-
-        Protected method (should not be called by clients).
+        The canvas_origin and canvas_size properties are valid after calling this method and _has_layout is True.
         """
-        pass
+        self.update_layout_using_composer_immediate(Geometry.IntRect(canvas_origin or (0, 0), canvas_size or (0, 0)))
 
     def refresh_layout_immediate(self) -> None:
         """Immediate re-layout the item. Deprecated. Use refresh_layout instead."""
-        self.refresh_layout()
-
-    def refresh_layout(self) -> None:
-        """Refresh the layout of this canvas item by asking container to layout again.
-
-        Thread-safe.
-        """
-        container_canvas_item = self.__container
-        if container_canvas_item:
-            container_canvas_item._update_child_item_layout(self)
-
-    def _update_child_item_layout(self, child_item: AbstractCanvasItem) -> None:
-        """Update the layout of a child item. Container subclasses should override.
-
-        Default implementation is to update the child layouts with the existing canvas size. Then, only if layout sizing
-        has changed, pass the update to the container.
-
-        Protected method (should not be called by clients).
-        """
-        if self.canvas_size:
-            self._update_child_layouts(self.canvas_size)
-        if self.__last_layout_sizing != self.layout_sizing:
-            container_canvas_item = self.__container
-            if container_canvas_item:
-                container_canvas_item._update_child_item_layout(self)
-            self.__last_layout_sizing = self.layout_sizing
+        canvas_rect = self.canvas_rect
+        assert canvas_rect
+        self.update_layout_using_composer_immediate(canvas_rect)
 
     @property
     def visible(self) -> bool:
@@ -928,7 +1125,7 @@ class AbstractCanvasItem:
     def visible(self, value: bool) -> None:
         if self.__visible != value:
             self.__visible = value
-            self.refresh_layout()
+            self.update()
 
     @property
     def is_visible(self) -> bool:
@@ -970,16 +1167,41 @@ class AbstractCanvasItem:
     def update_sizing(self, new_sizing: Sizing) -> None:
         if new_sizing != self.sizing:
             self.__sizing = new_sizing
-            self.refresh_layout()
+            self.update()
 
-    def update(self) -> None:
+    def _begin_batch_update(self) -> None:
+        with self.__update_lock:
+            self.__update_level += 1
+
+    def _end_batch_update(self) -> None:
+        with self.__update_lock:
+            self.__update_level -= 1
+            if self.__update_level == 0:
+                self._update()
+
+    @contextlib.contextmanager
+    def batch_update(self) -> typing.Iterator[typing.Any]:
+        self._begin_batch_update()
+        try:
+            yield
+        finally:
+           self._end_batch_update()
+
+    def _update(self) -> None:
         """Mark canvas item as needing a display update.
 
         Thread-safe.
 
         The canvas item will be repainted by the root canvas item.
         """
-        self._update_with_items()
+        if self.is_visible:
+            self._update_count += 1
+            self._invalidate_composer()
+            self._updated()
+
+    def update(self) -> None:
+        with self.batch_update():
+            pass
 
     def redraw(self) -> None:
         """Force full redraw of this item and children. Used for resolution changes."""
@@ -991,36 +1213,53 @@ class AbstractCanvasItem:
         """Force full redraw of this item. Used for resolution changes. Subclasses may override."""
         self.update()
 
-    def sync_redraw(self) -> None:
-        """Force full redraw of this item and children. Used for resolution changes."""
-        for canvas_item in self.canvas_items:
-            canvas_item.sync_redraw()
-        self._sync_redraw()
-
-    def _sync_redraw(self) -> None:
-        """Force full redraw of this item. Used for resolution changes. Subclasses may override."""
-        pass
-
-    def _update_with_items(self, canvas_items: typing.Optional[typing.Sequence[AbstractCanvasItem]] = None) -> None:
-        # thread-safe
-        self._update_count += 1
-        self._updated(canvas_items)
-
-    def _updated(self, canvas_items: typing.Optional[typing.Sequence[AbstractCanvasItem]] = None) -> None:
+    def _updated(self) -> None:
         # Notify this canvas item that a child has been updated, repaint if needed at next opportunity.
         # thread-safe
-        self.__pending_update = True
-        self._update_container(canvas_items)
+        if container := self.__container:
+            container.update()
 
-    def _update_container(self, canvas_items: typing.Optional[typing.Sequence[AbstractCanvasItem]] = None) -> None:
-        # if not in the middle of a nested update, and if this canvas item has
-        # a layout, update the container.
-        # thread-safe
-        container = self.__container
-        if container and self._has_layout:
-            canvas_items = list(canvas_items) if canvas_items else list()
-            canvas_items.append(self)
-            container._update_with_items(canvas_items)
+    def _get_composer_cache(self) -> ComposerCache:
+        return self.__cache
+
+    def _invalidate_composer(self) -> None:
+        # avoid the race condition where the composer gets set in _get_composer_inner immediately after
+        # being cleared here and no further updates occur, resulting in an incorrect composer.
+        with self.__composer_lock:
+            self.__composer = None
+
+    def get_composer(self, cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        """Return the composer for this canvas item. Subclasses should not override.
+
+        The layer canvas item is special in that it will not have a composer when called
+        from the container. This is because the layer canvas item runs its layout on a thread
+        and draws itself directly in the root container. The layer canvas item uses the
+        _get_composer_inner function to get its composer when it is ready to draw.
+        """
+        return self._get_composer_inner(cache)
+
+    def _get_composer_inner(self, cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        with self.__composer_lock:
+            if not self.__composer:
+                self.__composer = self._get_composer(cache)
+                # assert self.__composer, f"missing composer for {type(self)}"
+        return self.__composer
+
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        return None
+
+    def get_composer_immediate(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        return self.get_composer(composer_cache)
+
+    def update_layout_using_composer(self, canvas_rect: Geometry.IntRect) -> None:
+        composer = self.get_composer(self._get_composer_cache())
+        if composer:
+            composer.update_layout(canvas_rect.origin, canvas_rect.size)
+
+    def update_layout_using_composer_immediate(self, canvas_rect: Geometry.IntRect) -> None:
+        composer = self.get_composer_immediate(self._get_composer_cache())
+        if composer:
+            composer.update_layout(canvas_rect.origin, canvas_rect.size)
 
     def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
         """Repaint the canvas item to the drawing context.
@@ -1032,49 +1271,30 @@ class AbstractCanvasItem:
         The drawing should take place within the canvas_bounds.
         """
         assert self.canvas_size is not None
+        composer = self.get_composer(self._get_composer_cache())
+        canvas_rect = self.canvas_rect
+        if composer and canvas_rect:
+            composer.repaint(drawing_context, canvas_rect)
+
+    def _update_repaint_count_from_composer(self) -> None:
         self._repaint_count += 1
 
-    def _repaint_template(self, drawing_context: DrawingContext.DrawingContext, immediate: bool) -> None:
-        """A wrapper method for _repaint.
+    def _update_layout_from_composer(self, canvas_bounds: Geometry.IntRect) -> None:
+        did_layout_change = False
+        old_canvas_origin_ = self._canvas_origin_stream.value
+        if (old_canvas_origin_ is None) or (old_canvas_origin_ != canvas_bounds.origin):
+            self._canvas_origin_stream.value = canvas_bounds.origin
+            did_layout_change = True
+        old_canvas_size_ = self._canvas_size_stream.value
+        if (old_canvas_size_ is None) or (old_canvas_size_ != canvas_bounds.size):
+            self._canvas_size_stream.value = canvas_bounds.size
+            did_layout_change = True
+        self._layout_count += 1 if did_layout_change else 0
+        if did_layout_change:
+            self._layout_changed()
 
-        Callers should always call this method instead of _repaint directly. This helps keep the _repaint
-        implementations simple and easy to understand.
-        """
-        self._repaint_cache(drawing_context)
-
-    def _repaint_cache(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        self.__last_repaint_canvas_rect = self.canvas_rect
-        self._repaint(drawing_context)
-
-    def _repaint_if_needed(self, drawing_context: DrawingContext.DrawingContext, *, immediate: bool = False) -> None:
-        # Repaint if no cached version of the last paint is available.
-        # If no cached drawing context is available, regular _repaint is used to make a new one which is then cached.
-        # The cached drawing context is typically cleared during the update method.
-        # Subclasses will typically not need to override this method, except in special cases.
-        pending_update, self.__pending_update = self.__pending_update, False
-        if pending_update:
-            repaint_drawing_context = DrawingContext.DrawingContext()
-            self._repaint_template(repaint_drawing_context, immediate)
-            self.__repaint_drawing_context = repaint_drawing_context
-        if self.__repaint_drawing_context:
-            drawing_context.add(self.__repaint_drawing_context)
-
-    def _repaint_finished(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        # when the thread finishes the repaint, this method gets called. the normal container update
-        # has not been called yet since the repaint wasn't finished until now. this method performs
-        # the container update.
-        self._update_container()
-
-    def repaint_immediate(self, drawing_context: DrawingContext.DrawingContext, canvas_size: Geometry.IntSize) -> None:
-        self.update_layout(Geometry.IntPoint(), canvas_size)
-        self._repaint_template(drawing_context, immediate=True)
-
-    def update_if_repaint_cache_invalid(self) -> None:
-        for canvas_item in self.canvas_items:
-            canvas_item.update_if_repaint_cache_invalid()
-        if self.is_visible and self.__last_repaint_canvas_rect != self.canvas_rect:
-            # print(f"update_if_repaint_cache_invalid {type(self)} {self.__last_repaint_canvas_rect=} {self.canvas_rect=}")
-            self.update()
+    def _layout_changed(self) -> None:
+        pass
 
     def _draw_background(self, drawing_context: DrawingContext.DrawingContext) -> None:
         """Draw the background. Subclasses can call this."""
@@ -1099,20 +1319,6 @@ class AbstractCanvasItem:
                     drawing_context.rect(rect.left, rect.top, rect.width, rect.height)
                     drawing_context.stroke_style = border_color
                     drawing_context.stroke()
-
-    def _repaint_visible(self, drawing_context: DrawingContext.DrawingContext, visible_rect: Geometry.IntRect) -> None:
-        """
-            Repaint the canvas item to the drawing context within the visible area.
-
-            Subclasses can override this method to paint.
-
-            This method will be called on a thread.
-
-            The drawing should take place within the canvas_bounds.
-
-            The default implementation calls _repaint(drawing_context)
-        """
-        self._repaint_if_needed(drawing_context)
 
     def canvas_item_at_point(self, x: int, y: int) -> typing.Optional[AbstractCanvasItem]:
         canvas_items = self.canvas_items_at_point(x, y)
@@ -1259,6 +1465,15 @@ class LayoutItem(typing.Protocol):
     def update_layout(self, canvas_origin: typing.Optional[Geometry.IntPoint], canvas_size: typing.Optional[Geometry.IntSize]) -> None: ...
 
 
+class LayoutSizingItem(typing.Protocol):
+
+    @property
+    def is_visible(self) -> bool: raise NotImplementedError()
+
+    @property
+    def layout_sizing(self) -> Sizing: raise NotImplementedError()
+
+
 class CanvasItemAbstractLayout:
 
     """
@@ -1272,6 +1487,9 @@ class CanvasItemAbstractLayout:
     def __init__(self, margins: typing.Optional[Geometry.Margins] = None, spacing: typing.Optional[int] = None) -> None:
         self.margins = margins if margins is not None else Geometry.Margins(0, 0, 0, 0)
         self.spacing = spacing if spacing else 0
+
+    def copy(self) -> CanvasItemAbstractLayout:
+        raise NotImplementedError()
 
     def calculate_row_layout(self, canvas_origin: Geometry.IntPoint, canvas_size: Geometry.IntSize,
                              canvas_items: typing.Sequence[LayoutItem]) -> ConstraintResultType:
@@ -1331,7 +1549,7 @@ class CanvasItemAbstractLayout:
         elif clear_if_missing:
             setattr(sizing_data, property, None)
 
-    def _get_overlap_sizing(self, canvas_items: typing.Sequence[typing.Optional[LayoutItem]]) -> Sizing:
+    def _get_overlap_sizing(self, canvas_items: typing.Sequence[typing.Optional[LayoutSizingItem]]) -> Sizing:
         """
             A commonly used sizing method to determine the preferred/min/max assuming everything is stacked/overlapping.
             Does not include spacing or margins.
@@ -1360,7 +1578,7 @@ class CanvasItemAbstractLayout:
             sizing_data.preferred_height = None
         return Sizing(sizing_data)
 
-    def _get_column_sizing(self, canvas_items: typing.Sequence[LayoutItem])-> Sizing:
+    def _get_column_sizing(self, canvas_items: typing.Sequence[LayoutSizingItem])-> Sizing:
         """
             A commonly used sizing method to determine the preferred/min/max assuming everything is a column.
             Does not include spacing or margins.
@@ -1386,7 +1604,7 @@ class CanvasItemAbstractLayout:
             sizing_data.maximum_height = None
         return Sizing(sizing_data)
 
-    def _get_row_sizing(self, canvas_items: typing.Sequence[LayoutItem]) -> Sizing:
+    def _get_row_sizing(self, canvas_items: typing.Sequence[LayoutSizingItem]) -> Sizing:
         """
             A commonly used sizing method to determine the preferred/min/max assuming everything is a column.
             Does not include spacing or margins.
@@ -1428,14 +1646,14 @@ class CanvasItemAbstractLayout:
             sizing_data.preferred_height += self.margins.top + self.margins.bottom + y_spacing
         return sizing_data
 
-    def add_canvas_item(self, canvas_item: LayoutItem, pos: typing.Optional[Geometry.IntPoint]) -> None:
+    def add_canvas_item(self, canvas_item: typing.Any, pos: typing.Optional[Geometry.IntPoint]) -> None:
         """
             Subclasses may override this method to get position specific information when a canvas item is added to
             the layout.
         """
         pass
 
-    def remove_canvas_item(self, canvas_item: LayoutItem) -> None:
+    def remove_canvas_item(self, canvas_item: typing.Any) -> None:
         """
             Subclasses may override this method to clean up position specific information when a canvas item is removed
             from the layout.
@@ -1446,7 +1664,7 @@ class CanvasItemAbstractLayout:
         """ Subclasses must override this method to layout canvas item. """
         raise NotImplementedError()
 
-    def get_sizing(self, canvas_items: typing.Sequence[LayoutItem]) -> Sizing:
+    def get_sizing(self, canvas_items: typing.Sequence[LayoutSizingItem]) -> Sizing:
         """
             Return the sizing object for this layout. Includes spacing and margins.
 
@@ -1472,11 +1690,14 @@ class CanvasItemLayout(CanvasItemAbstractLayout):
     def __init__(self, margins: typing.Optional[Geometry.Margins] = None, spacing: typing.Optional[int] = None) -> None:
         super().__init__(margins, spacing)
 
+    def copy(self) -> CanvasItemAbstractLayout:
+        return CanvasItemLayout(self.margins, self.spacing)
+
     def layout(self, canvas_origin: Geometry.IntPoint, canvas_size: Geometry.IntSize, canvas_items: typing.Sequence[LayoutItem]) -> None:
         for canvas_item in canvas_items:
             self.update_canvas_item_layout(canvas_origin, canvas_size, canvas_item)
 
-    def get_sizing(self, canvas_items: typing.Sequence[LayoutItem]) -> Sizing:
+    def get_sizing(self, canvas_items: typing.Sequence[LayoutSizingItem]) -> Sizing:
         return Sizing(self._adjust_sizing(self._get_overlap_sizing(canvas_items).sizing_data, 0, 0))
 
     def create_spacing_item(self, spacing: int) -> AbstractCanvasItem:
@@ -1499,6 +1720,9 @@ class CanvasItemColumnLayout(CanvasItemAbstractLayout):
         super().__init__(margins, spacing)
         self.alignment = alignment
 
+    def copy(self) -> CanvasItemAbstractLayout:
+        return CanvasItemColumnLayout(self.margins, self.spacing, self.alignment)
+
     def layout(self, canvas_origin: Geometry.IntPoint, canvas_size: Geometry.IntSize, canvas_items: typing.Sequence[LayoutItem]) -> None:
         # calculate the vertical placement
         column_layout = self.calculate_column_layout(canvas_origin, canvas_size, canvas_items)
@@ -1512,7 +1736,7 @@ class CanvasItemColumnLayout(CanvasItemAbstractLayout):
             x_positions = [round(canvas_origin.x + self.margins.left + (available_width - width) * 0.5) for width in widths]
         self.layout_canvas_items(x_positions, column_layout.origins, widths, column_layout.sizes, canvas_items)
 
-    def get_sizing(self, canvas_items: typing.Sequence[LayoutItem]) -> Sizing:
+    def get_sizing(self, canvas_items: typing.Sequence[LayoutSizingItem]) -> Sizing:
         return Sizing(self._adjust_sizing(self._get_column_sizing(canvas_items).sizing_data, 0, self.spacing * (len(canvas_items) - 1)))
 
     def create_spacing_item(self, spacing: int) -> AbstractCanvasItem:
@@ -1539,6 +1763,9 @@ class CanvasItemRowLayout(CanvasItemAbstractLayout):
         super().__init__(margins, spacing)
         self.alignment = alignment
 
+    def copy(self) -> CanvasItemAbstractLayout:
+        return CanvasItemRowLayout(self.margins, self.spacing, self.alignment)
+
     def layout(self, canvas_origin: Geometry.IntPoint, canvas_size: Geometry.IntSize, canvas_items: typing.Sequence[LayoutItem]) -> None:
         row_layout = self.calculate_row_layout(canvas_origin, canvas_size, canvas_items)
         heights = [canvas_item.layout_sizing.get_unrestrained_height(canvas_size.height - self.margins.top - self.margins.bottom) for canvas_item in canvas_items]
@@ -1551,7 +1778,7 @@ class CanvasItemRowLayout(CanvasItemAbstractLayout):
             y_positions = [round(canvas_origin.y + self.margins.top + (available_height - height) // 2) for height in heights]
         self.layout_canvas_items(row_layout.origins, y_positions, row_layout.sizes, heights, canvas_items)
 
-    def get_sizing(self, canvas_items: typing.Sequence[LayoutItem]) -> Sizing:
+    def get_sizing(self, canvas_items: typing.Sequence[LayoutSizingItem]) -> Sizing:
         return Sizing(self._adjust_sizing(self._get_row_sizing(canvas_items).sizing_data, self.spacing * (len(canvas_items) - 1), 0))
 
     def create_spacing_item(self, spacing: int) -> AbstractCanvasItem:
@@ -1577,25 +1804,61 @@ class CanvasItemGridLayout(CanvasItemAbstractLayout):
         parameter.
     """
 
-    def __init__(self, size: Geometry.IntSize, margins: typing.Optional[Geometry.Margins] = None, spacing: typing.Optional[int] = None) -> None:
+    def __init__(self, size: Geometry.IntSize, margins: typing.Optional[Geometry.Margins] = None, spacing: typing.Optional[int] = None, columns: typing.Optional[typing.List[typing.List[typing.Optional[typing.Any]]]] = None, canvas_items: typing.Optional[typing.List[typing.Any]] = None) -> None:
         super().__init__(margins, spacing)
         assert size.width > 0 and size.height > 0
         self.__size = size
-        self.__columns: typing.List[typing.List[typing.Optional[LayoutItem]]] = [[None for _ in range(self.__size.height)] for _ in range(self.__size.width)]
+        # columns stores the canvas items in a grid. canvas items keeps track of the order in which they're added or
+        # removed. this allows for finding the associated index of a canvas item in the layout so that the layout can
+        # use the list of layout items passed in to layout or get_sizing.
+        self.__columns = [[None for _ in range(size.height)] for _ in range(size.width)]
+        if columns is not None and canvas_items is not None:
+            self.__canvas_items = list(canvas_items)
+            for row in range(size.height):
+                for column in range(size.width):
+                    old_canvas_item = columns[column][row]
+                    if old_canvas_item:
+                        index = canvas_items.index(columns[column][row])
+                        self.__columns[column][row] = self.__canvas_items[index]
+                    else:
+                        self.__columns[column][row] = None
+        else:
+            self.__columns = [[None for _ in range(size.height)] for _ in range(size.width)]
+            self.__canvas_items = list()
 
-    def add_canvas_item(self, canvas_item: LayoutItem, pos: typing.Optional[Geometry.IntPoint]) -> None:
+    def copy(self) -> CanvasItemAbstractLayout:
+        return CanvasItemGridLayout(self.__size, self.margins, self.spacing, self.__columns, self.__canvas_items)
+
+    def add_canvas_item(self, canvas_item: typing.Any, pos: typing.Optional[Geometry.IntPoint]) -> None:
         assert pos
         assert pos.x >= 0 and pos.x < self.__size.width
         assert pos.y >= 0 and pos.y < self.__size.height
         self.__columns[pos.x][pos.y] = canvas_item
+        self.__canvas_items.append(canvas_item)
 
-    def remove_canvas_item(self, canvas_item: LayoutItem) -> None:
+    def remove_canvas_item(self, canvas_item: typing.Any) -> None:
         for x in range(self.__size.width):
             for y in range(self.__size.height):
                 if self.__columns[x][y] == canvas_item:
                     self.__columns[x][y] = None
+        self.__canvas_items.remove(canvas_item)
+
+    def __layout_sizing_item_at(self, canvas_items: typing.Sequence[LayoutSizingItem], x: int, y: int) -> typing.Optional[LayoutSizingItem]:
+        canvas_item = self.__columns[x][y]
+        if canvas_item is not None:
+            index = self.__canvas_items.index(canvas_item)
+            return canvas_items[index]
+        return None
+
+    def __layout_item_at(self, canvas_items: typing.Sequence[LayoutItem], x: int, y: int) -> typing.Optional[LayoutItem]:
+        canvas_item = self.__columns[x][y]
+        if canvas_item is not None:
+            index = self.__canvas_items.index(canvas_item)
+            return canvas_items[index]
+        return None
 
     def layout(self, canvas_origin: Geometry.IntPoint, canvas_size: Geometry.IntSize, canvas_items: typing.Sequence[LayoutItem]) -> None:
+        canvas_items = list(canvas_items)
         # calculate the horizontal placement
         # calculate the sizing (x, width) for each column
         canvas_item_count = self.__size.width
@@ -1604,7 +1867,7 @@ class CanvasItemGridLayout(CanvasItemAbstractLayout):
         content_width = canvas_size.width - self.margins.left - self.margins.right - self.spacing * spacing_count
         constraints = list()
         for x in range(self.__size.width):
-            sizing = self._get_overlap_sizing([visible_canvas_item(self.__columns[x][y]) for y in range(self.__size.height)])
+            sizing = self._get_overlap_sizing([visible_layout_sizing_item(self.__layout_item_at(canvas_items, x, y)) for y in range(self.__size.height)])
             constraints.append(sizing.get_width_constraint(content_width))
         # run the layout engine
         row_layout = constraint_solve(content_left, content_width, constraints, self.spacing)
@@ -1616,7 +1879,7 @@ class CanvasItemGridLayout(CanvasItemAbstractLayout):
         content_height = canvas_size.height - self.margins.top - self.margins.bottom - self.spacing * spacing_count
         constraints = list()
         for y in range(self.__size.height):
-            sizing = self._get_overlap_sizing([visible_canvas_item(self.__columns[x][y]) for x in range(self.__size.width)])
+            sizing = self._get_overlap_sizing([visible_layout_sizing_item(self.__layout_item_at(canvas_items, x, y)) for x in range(self.__size.width)])
             constraints.append(sizing.get_height_constraint(content_height))
         # run the layout engine
         column_layout = constraint_solve(content_top, content_height, constraints, self.spacing)
@@ -1628,7 +1891,7 @@ class CanvasItemGridLayout(CanvasItemAbstractLayout):
         combined_canvas_items = list()
         for x in range(self.__size.width):
             for y in range(self.__size.height):
-                canvas_item = visible_canvas_item(self.__columns[x][y])
+                canvas_item = visible_layout_item(self.__layout_item_at(canvas_items, x, y))
                 if canvas_item is not None:
                     combined_xs.append(row_layout.origins[x])
                     combined_ys.append(column_layout.origins[y])
@@ -1637,12 +1900,13 @@ class CanvasItemGridLayout(CanvasItemAbstractLayout):
                     combined_canvas_items.append(canvas_item)
         self.layout_canvas_items(combined_xs, combined_ys, combined_widths, combined_heights, combined_canvas_items)
 
-    def get_sizing(self, canvas_items: typing.Sequence[LayoutItem]) -> Sizing:
+    def get_sizing(self, canvas_items: typing.Sequence[LayoutSizingItem]) -> Sizing:
         """
             Calculate the sizing for the grid. Treat columns and rows independently.
 
             Override from abstract layout.
         """
+        canvas_items = list(canvas_items)
         sizing_data = SizingData()
         sizing_data.maximum_width = 0
         sizing_data.maximum_height = 0
@@ -1650,7 +1914,7 @@ class CanvasItemGridLayout(CanvasItemAbstractLayout):
         # the widths
         canvas_item_sizings = list()
         for x in range(self.__size.width):
-            canvas_items_ = [visible_canvas_item(self.__columns[x][y]) for y in range(self.__size.height)]
+            canvas_items_ = [visible_layout_sizing_item(self.__layout_sizing_item_at(canvas_items, x, y)) for y in range(self.__size.height)]
             canvas_item_sizings.append(self._get_overlap_sizing(canvas_items_))
         for canvas_item_sizing in canvas_item_sizings:
             self._combine_sizing_property(sizing_data, canvas_item_sizing, "preferred_width", operator.add)
@@ -1659,7 +1923,7 @@ class CanvasItemGridLayout(CanvasItemAbstractLayout):
         # the heights
         canvas_item_sizings = list()
         for y in range(self.__size.height):
-            canvas_items_ = [visible_canvas_item(self.__columns[x][y]) for x in range(self.__size.width)]
+            canvas_items_ = [visible_layout_sizing_item(self.__layout_sizing_item_at(canvas_items, x, y)) for x in range(self.__size.width)]
             canvas_item_sizings.append(self._get_overlap_sizing(canvas_items_))
         for canvas_item_sizing in canvas_item_sizings:
             self._combine_sizing_property(sizing_data, canvas_item_sizing, "preferred_height", operator.add)
@@ -1681,45 +1945,51 @@ class CanvasItemGridLayout(CanvasItemAbstractLayout):
         return Sizing(sizing_data)
 
 
-class CompositionLayoutRenderTrait:
-    """A trait (a set of methods for extending a class) allow customization of composition layout/rendering.
+class CanvasItemCompositionComposer(BaseComposer):
+    def __init__(self,
+                 canvas_item: AbstractCanvasItem,
+                 layout_sizing: Sizing,
+                 composer_cache: ComposerCache,
+                 layout: CanvasItemAbstractLayout,
+                 child_composers: typing.Sequence[BaseComposer],
+                 background_color: typing.Optional[typing.Union[str, DrawingContext.LinearGradient]],
+                 border_color: typing.Optional[str]) -> None:
+        super().__init__(canvas_item, layout_sizing, composer_cache)
+        self.__layout = layout
+        self.__child_composers = child_composers
+        self.__background_color = background_color
+        self.__border_color = border_color
 
-    Since traits aren't supported directly in Python, this works by having associated methods in the
-    CanvasItemComposition class directly invoke the methods of this or a subclass of this object.
-    """
+    def _update_layout(self, canvas_bounds: Geometry.IntRect) -> None:
+        self.__layout.layout(Geometry.IntPoint(), canvas_bounds.size, self.__child_composers)
 
-    def __init__(self, canvas_item_composition: CanvasItemComposition):
-        self._canvas_item_composition = canvas_item_composition
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        self.__draw_background(drawing_context, canvas_bounds, self.__background_color)
+        self._repaint_children(drawing_context, canvas_bounds, self.__child_composers)
+        self.__draw_border(drawing_context, canvas_bounds, self.__border_color)
+        self._draw_unique_marker(drawing_context, canvas_bounds)
 
-    def close(self) -> None:
-        self._stop_render_behavior()
-        self._canvas_item_composition = None  # type: ignore
+    def _repaint_children(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, child_composers: typing.Sequence[BaseComposer]) -> None:
+        with drawing_context.saver():
+            drawing_context.translate(canvas_bounds.left, canvas_bounds.top)
+            for child_composer in child_composers:
+                child_composer.repaint(drawing_context, child_composer._canvas_bounds)
 
-    def _stop_render_behavior(self) -> None:
-        pass
+    def __draw_background(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, background_color: typing.Optional[typing.Union[str, DrawingContext.LinearGradient]]) -> None:
+        if background_color:
+            with drawing_context.saver():
+                drawing_context.begin_path()
+                drawing_context.rect(canvas_bounds.left, canvas_bounds.top, canvas_bounds.width, canvas_bounds.height)
+                drawing_context.fill_style = background_color
+                drawing_context.fill()
 
-    def _try_update_with_items(self, canvas_items: typing.Optional[typing.Sequence[AbstractCanvasItem]] = None) -> bool:
-        # thread-safe
-        return False
-
-    def _try_updated(self) -> bool:
-        # thread-safe
-        return False
-
-    def _try_repaint_template(self, drawing_context: DrawingContext.DrawingContext, immediate: bool) -> bool:
-        return False
-
-    def _try_repaint_if_needed(self, drawing_context: DrawingContext.DrawingContext, *, immediate: bool = False) -> bool:
-        return False
-
-    def _try_repaint_immediate(self, drawing_context: DrawingContext.DrawingContext, canvas_size: Geometry.IntSize) -> bool:
-        return False
-
-    def _redraw(self) -> None:
-        pass
-
-    def _sync_redraw(self) -> None:
-        pass
+    def __draw_border(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, border_color: typing.Optional[str]) -> None:
+        if border_color:
+            with drawing_context.saver():
+                drawing_context.begin_path()
+                drawing_context.rect(canvas_bounds.left, canvas_bounds.top, canvas_bounds.width, canvas_bounds.height)
+                drawing_context.stroke_style = border_color
+                drawing_context.stroke()
 
 
 class CanvasItemComposition(AbstractCanvasItem):
@@ -1732,17 +2002,13 @@ class CanvasItemComposition(AbstractCanvasItem):
     Child canvas items with higher indexes are considered to be foremost.
     """
 
-    def __init__(self, layout_render_trait: typing.Optional[CompositionLayoutRenderTrait] = None) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.__canvas_items: typing.List[AbstractCanvasItem] = list()
         self.layout: CanvasItemAbstractLayout = CanvasItemLayout()
         self.__layout_lock = threading.RLock()
-        self.__layout_render_trait = layout_render_trait or CompositionLayoutRenderTrait(self)
 
     def close(self) -> None:
-        if self.__layout_render_trait:
-            self.__layout_render_trait.close()
-            self.__layout_render_trait = typing.cast(typing.Any, None)
         with self.__layout_lock:
             canvas_items = self.canvas_items
             for canvas_item in canvas_items:
@@ -1765,21 +2031,6 @@ class CanvasItemComposition(AbstractCanvasItem):
         else:
             return super()._summary(indent) + f" [{len(self.__canvas_items)}]"
 
-    def _stop_render_behavior(self) -> None:
-        layout_render_trait = self.__layout_render_trait  # only read once to be more thread-safe
-        if layout_render_trait:
-            self.__layout_render_trait._stop_render_behavior()
-
-    def _prepare_render(self) -> None:
-        for canvas_item in self.__canvas_items:
-            canvas_item._prepare_render()
-        super()._prepare_render()
-
-    def _sync_redraw(self) -> None:
-        layout_render_trait = self.__layout_render_trait  # only read once to be more thread-safe
-        if layout_render_trait:
-            self.__layout_render_trait._sync_redraw()
-
     @property
     def canvas_items_count(self) -> int:
         """Return count of canvas items managed by this composition."""
@@ -1797,54 +2048,8 @@ class CanvasItemComposition(AbstractCanvasItem):
                 return [canvas_item for canvas_item in self.__canvas_items if canvas_item and canvas_item.visible]
         return list()
 
-    def layout_immediate(self, canvas_size: Geometry.IntSize, force: bool = True) -> None:
-        self._prepare_render()
-        self.update_layout(Geometry.IntPoint(), canvas_size)
-
-    def _update_with_items(self, canvas_items: typing.Optional[typing.Sequence[AbstractCanvasItem]] = None) -> None:
-        # thread-safe
-        layout_render_trait = self.__layout_render_trait  # only read once to be more thread-safe
-        if not layout_render_trait or not layout_render_trait._try_update_with_items(canvas_items):
-            super()._update_with_items(canvas_items)
-
-    def _updated(self, canvas_items: typing.Optional[typing.Sequence[AbstractCanvasItem]] = None) -> None:
-        # thread-safe
-        layout_render_trait = self.__layout_render_trait  # only read once to be more thread-safe
-        if not layout_render_trait or not layout_render_trait._try_updated():
-            super()._updated(canvas_items)
-
-    def _update_layout(self, canvas_origin: typing.Optional[Geometry.IntPoint], canvas_size: typing.Optional[Geometry.IntSize]) -> None:
-        """Private method, but available to tests."""
-        with self.__layout_lock:
-            if self.__canvas_items is not None:
-                assert canvas_origin is not None
-                assert canvas_size is not None
-                canvas_origin_ = Geometry.IntPoint.make(canvas_origin)
-                canvas_size_ = Geometry.IntSize.make(canvas_size)
-                super().update_layout(canvas_origin_, canvas_size_)
-
-    def _update_child_layouts(self, canvas_size: typing.Optional[Geometry.IntSize]) -> None:
-        with self.__layout_lock:
-            if self.__canvas_items is not None:
-                assert canvas_size is not None
-                canvas_size = Geometry.IntSize.make(canvas_size)
-                visible_canvas_items = self.visible_canvas_items
-                self.layout.layout(Geometry.IntPoint(), canvas_size, visible_canvas_items)
-                # layout will loop through the visible canvas items and the canvas items may have inconsistent layout
-                # (overlaps) during the loop. when repaint is triggered on individual items during the loop,
-                # it may result in the drawing overlapped items or missing space between items. to clean this up at
-                # the end of layout, request a repaint from items where the last paint differs from the canvas rect.
-                # this is a hack to avoid putting a lock in place. this is reproducible on fast drawing systems (M1
-                # Mac) by putting an image in the top left of a 2x2 layout and then slowly dragging the horizontal or
-                # vertical splitter until it snaps into the middle. during the snap, the drawing is inconsistent. for
-                # example, when dragging the horizontal splitter up and down, the empty panel at the bottom may
-                # request a repaint while the image at the top left has not yet been resized. a fast repaint will
-                # draw the image overlapped with the empty panel. the empty panel will think it has successfully
-                # updated and won't draw again. then the image panel will get resized and draw at its correct size.
-                # the empty panel will be left with remnants of the overlapped image. this needs design in the layout
-                # system to only draw or only update consistent layouts. this is a hack solution until a separate
-                # layout tree is passed to repaint.
-                self.update_if_repaint_cache_invalid()
+    def layout_immediate(self, canvas_size: Geometry.IntSize) -> None:
+        self.update_layout_immediate(Geometry.IntPoint(), canvas_size)
 
     # override sizing information. let layout provide it.
     @property
@@ -1883,10 +2088,6 @@ class CanvasItemComposition(AbstractCanvasItem):
         # I'm not sure if this is the right implementation. It works for now.
         self.update_sizing(self.layout.get_sizing(self.visible_canvas_items))
 
-    def canvas_item_layout_sizing_changed(self, canvas_item: AbstractCanvasItem) -> None:
-        """ Contained canvas items call this when their layout_sizing changes. """
-        self.refresh_layout()
-
     def _insert_canvas_item_direct(self, before_index: int, canvas_item: AbstractCanvasItem,
                                    pos: typing.Optional[Geometry.IntPoint] = None) -> None:
         self.insert_canvas_item(before_index, canvas_item, pos)
@@ -1903,9 +2104,6 @@ class CanvasItemComposition(AbstractCanvasItem):
         # tell the layout about the canvas item. layout does not occur here.
         self.layout.add_canvas_item(canvas_item, pos)
         # trigger layout of both this item and the container.
-        if container := self.container:
-            container.refresh_layout()
-        self.refresh_layout()
         self.update()
         return canvas_item
 
@@ -1937,9 +2135,6 @@ class CanvasItemComposition(AbstractCanvasItem):
         canvas_item.container = None
         self._remove_canvas_item_direct(canvas_item)
         # trigger layout of both this item and the container.
-        if container := self.container:
-            container.refresh_layout()
-        self.refresh_layout()
         self.update()
 
     def remove_canvas_item(self, canvas_item: AbstractCanvasItem) -> None:
@@ -2001,7 +2196,7 @@ class CanvasItemComposition(AbstractCanvasItem):
             canvas_item._set_canvas_origin(Geometry.IntPoint())
         # allow subclasses to restore state
         self._did_wrap_child_canvas_item(wrap_state)
-        self.refresh_layout()
+        self.update()
 
     def unwrap_canvas_item(self, canvas_item: AbstractCanvasItem) -> None:
         """ Replace the canvas item container with the canvas item. """
@@ -2029,35 +2224,36 @@ class CanvasItemComposition(AbstractCanvasItem):
         # allow subclasses to restore state
         self_container._did_unwrap_child_canvas_item(wrap_state)
         # update the layout if origin and size already known
-        self.refresh_layout()
+        self.update()
 
-    def _repaint_template(self, drawing_context: DrawingContext.DrawingContext, immediate: bool) -> None:
-        layout_render_trait = self.__layout_render_trait  # only read once to be more thread-safe
-        if not layout_render_trait or not layout_render_trait._try_repaint_template(drawing_context, immediate):
-            self._repaint_children(drawing_context, immediate=immediate)
-            self._repaint_cache(drawing_context)
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        child_composers = list[BaseComposer]()
+        for canvas_item in self.visible_canvas_items:
+            composer = canvas_item.get_composer(composer_cache)
+            if composer:
+                child_composers.append(composer)
+            else:
+                return None
+        return self._get_composition_composer(child_composers, composer_cache)
 
-    def _repaint_if_needed(self, drawing_context: DrawingContext.DrawingContext, *, immediate: bool = False) -> None:
-        layout_render_trait = self.__layout_render_trait  # only read once to be more thread-safe
-        if not layout_render_trait or not layout_render_trait._try_repaint_if_needed(drawing_context, immediate=immediate):
-            super()._repaint_if_needed(drawing_context, immediate=immediate)
+    def _get_composition_composer(self, child_composers: typing.Sequence[BaseComposer], composer_cache: ComposerCache) -> BaseComposer:
+        return CanvasItemCompositionComposer(self, self.layout_sizing, composer_cache, self.layout.copy(), child_composers, self.background_color, self.border_color)
+
+    def get_composer_immediate(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        child_composers = list[BaseComposer]()
+        for canvas_item in self.visible_canvas_items:
+            composer = canvas_item.get_composer_immediate(composer_cache)
+            if composer:
+                child_composers.append(composer)
+            else:
+                return None
+        return self._get_composition_composer(child_composers, composer_cache)
 
     def repaint_immediate(self, drawing_context: DrawingContext.DrawingContext, canvas_size: Geometry.IntSize) -> None:
-        layout_render_trait = self.__layout_render_trait  # only read once to be more thread-safe
-        if not layout_render_trait or not layout_render_trait._try_repaint_immediate(drawing_context, canvas_size):
-            super().repaint_immediate(drawing_context, canvas_size)
-
-    def _repaint_children(self, drawing_context: DrawingContext.DrawingContext, *, immediate: bool = False) -> None:
-        """Paint items from back to front."""
-        self._draw_background(drawing_context)
-        for canvas_item in self.visible_canvas_items:
-            if canvas_item._has_layout:
-                with drawing_context.saver():
-                    canvas_item_rect = canvas_item.canvas_rect
-                    if canvas_item_rect:
-                        drawing_context.translate(canvas_item_rect.left, canvas_item_rect.top)
-                        canvas_item._repaint_if_needed(drawing_context, immediate=immediate)
-        self._draw_border(drawing_context)
+        # repaint assumes that the canvas item being repainted already has a canvas rect.
+        # to ensure it does, call _update_layout here.
+        self.update_layout_using_composer(Geometry.IntRect(Geometry.IntPoint(), canvas_size))
+        self._repaint(drawing_context)
 
     def _canvas_items_at_point(self, visible_canvas_items: typing.Sequence[AbstractCanvasItem], x: int, y: int) -> typing.List[AbstractCanvasItem]:
         """Returns list of canvas items under x, y, ordered from back to front."""
@@ -2094,49 +2290,53 @@ class CanvasItemComposition(AbstractCanvasItem):
         return False
 
 
+class DrawingContextCanvasItemComposer(BaseComposer):
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, cache: ComposerCache, drawing_context: typing.Optional[DrawingContext.DrawingContext]) -> None:
+        super().__init__(canvas_item, layout_sizing, cache)
+        self.__drawing_context = drawing_context
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        if self.__drawing_context:
+            with drawing_context.saver():
+                # drawing_context.translate(canvas_bounds.left, canvas_bounds.top)
+                drawing_context.add(self.__drawing_context)
+
+    def _update_repaint_count(self) -> None:
+        # override this to prevent the repaint count from being updated since this is a passthrough for the layer
+        # and doesn't represent a real repaint.
+        pass
+
+
 _threaded_rendering_enabled = True
 
 
-class LayerLayoutRenderTrait(CompositionLayoutRenderTrait):
-
-    _layer_id = 0
+class LayerCanvasItem(CanvasItemComposition):
+    """A composite canvas item that does layout and repainting in a thread."""
 
     _executor = concurrent.futures.ThreadPoolExecutor()
 
-    def __init__(self, canvas_item_composition: CanvasItemComposition):
-        super().__init__(canvas_item_composition)
-        LayerLayoutRenderTrait._layer_id += 1
-        self.__layer_id = LayerLayoutRenderTrait._layer_id
-        self.__layer_lock = threading.RLock()
-        self.__layer_drawing_context: typing.Optional[DrawingContext.DrawingContext] = None
-        self.__layer_seed = 0
+    def __init__(self) -> None:
+        super().__init__()
         self.__executing = False
         self.__cancel = False
-        self.__needs_repaint = False
-        self.__pending_layout_canvas_items = list[AbstractCanvasItem]()
-        self._layer_thread_suppress = not _threaded_rendering_enabled  # for testing
-        self.__layer_thread_condition = threading.Condition()
-        # Python 3.9+: Optional[concurrent.futures.Future[Any]]
-        self.__repaint_one_future: typing.Optional[typing.Any] = None
+        self.__needs_repaint = False  # keep track of repaint requests that arrive during an existing repaint
+        self.__layer_drawing_context: typing.Optional[DrawingContext.DrawingContext] = None
+        self.__layer_thread_lock = threading.RLock()
+        self.__repaint_one_future: typing.Optional[concurrent.futures.Future[typing.Any]] = None
+        self.__canvas_widget_section_ref: typing.Optional[CanvasWidgetSection] = None
 
     def close(self) -> None:
-        self._sync_repaint()
+        self._stop_render_behavior()
+        if self.__canvas_widget_section_ref:
+            self.__canvas_widget_section_ref = None
         super().close()
 
     def _stop_render_behavior(self) -> None:
         self.__cancel = True
-        self._sync_repaint()
-        self.__layer_drawing_context = None
-
-    def _sync_redraw(self) -> None:
-        self._sync_repaint()
-
-    def _sync_repaint(self) -> None:
         done_event = threading.Event()
-        with self.__layer_thread_condition:
+        with self.__layer_thread_lock:
             if self.__repaint_one_future:
-                # Python 3.9: Optional[concurrent.futures.Future[Any]]
-                def repaint_done(future: typing.Any) -> None:
+                def repaint_done(future: typing.Optional[concurrent.futures.Future[typing.Any]]) -> None:
                     done_event.set()
 
                 self.__repaint_one_future.add_done_callback(repaint_done)
@@ -2144,87 +2344,126 @@ class LayerLayoutRenderTrait(CompositionLayoutRenderTrait):
                 done_event.set()
         done_event.wait()
 
-    # Python 3.9: Optional[concurrent.futures.Future[Any]]
-    def __repaint_done(self, future: typing.Any) -> None:
-        with self.__layer_thread_condition:
+    def __repaint_done(self, future: typing.Optional[concurrent.futures.Future[typing.Any]]) -> None:
+        with self.__layer_thread_lock:
             self.__repaint_one_future = None
             if self.__needs_repaint:
                 self.__queue_repaint()
 
     def __queue_repaint(self) -> None:
-        with self.__layer_thread_condition:
+        with self.__layer_thread_lock:
+            # this will not launch another repaint layer if one is already running. updates will stack up and
+            # be processed at the end of the current update in repaint done.
             if not self.__cancel and not self.__repaint_one_future:
-                self.__repaint_one_future = LayerLayoutRenderTrait._executor.submit(self.__repaint_layer)
+                self.__needs_repaint = False
+                self.__repaint_one_future = LayerCanvasItem._executor.submit(self.__repaint_layer)
                 self.__repaint_one_future.add_done_callback(self.__repaint_done)
+            else:
+                self.__needs_repaint = True
 
-    def _try_updated(self) -> bool:
+    def _repaint_finished(self, drawing_context: DrawingContext.DrawingContext) -> None:
+        # when the thread finishes the repaint, this method gets called. the normal container update
+        # has not been called yet since the repaint wasn't finished until now. this method performs
+        # the container update. it does not call the regular update again because that would re-invalidate
+        # this canvas item itself and cause another repaint.
+        self.__layer_drawing_context = drawing_context
+        self._invalidate_composer()
+        super()._updated()
+
+    def _updated(self) -> None:
         # thread-safe
-        with self.__layer_thread_condition:
-            self.__needs_repaint = True
-            if not self._layer_thread_suppress:
+        with self.__layer_thread_lock:
+            if _threaded_rendering_enabled:
                 self.__queue_repaint()
         # normally, this method would mark a pending update and forward the update to the container;
         # however with the layer, since drawing occurs on a thread, this must occur after the thread
         # is finished. if the thread is suppressed (typically during testing), use the regular flow.
-        if self._layer_thread_suppress:
+        if not _threaded_rendering_enabled:
             # pass through updates in the thread is suppressed, so that updates actually occur.
-            return False
-        return True
+            super()._updated()
 
-    def _try_repaint_template(self, drawing_context: DrawingContext.DrawingContext, immediate: bool) -> bool:
-        if immediate:
-            canvas_size = self._canvas_item_composition.canvas_size
-            if canvas_size:
-                self._canvas_item_composition.repaint_immediate(drawing_context, canvas_size)
+    def get_composer(self, cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        if self.__layer_drawing_context:
+            return DrawingContextCanvasItemComposer(self, self.layout_sizing, cache, self.__layer_drawing_context)
         else:
-            with self.__layer_lock:
-                layer_drawing_context = self.__layer_drawing_context
-                layer_seed = self.__layer_seed
-            canvas_size = self._canvas_item_composition.canvas_size
-            if canvas_size:
-                drawing_context.begin_layer(self.__layer_id, layer_seed, 0, 0, *tuple(canvas_size))
-                if layer_drawing_context:
-                    drawing_context.add(layer_drawing_context)
-                drawing_context.end_layer(self.__layer_id, layer_seed, 0, 0, *tuple(canvas_size))
-        return True
+            return EmptyCanvasItemComposer(self, self.layout_sizing, cache)
 
-    def _try_repaint_if_needed(self, drawing_context: DrawingContext.DrawingContext, *, immediate: bool = False) -> bool:
-        # If the render behavior is a layer, it will have its own cached drawing context. Use it.
-        self._canvas_item_composition._repaint_template(drawing_context, immediate)
-        return True
+    def _layout_changed(self) -> None:
+        self._updated()
 
-    def _try_repaint_immediate(self, drawing_context: DrawingContext.DrawingContext, canvas_size: Geometry.IntSize) -> bool:
-        self._canvas_item_composition._inserted(None)
-        layer_thread_suppress, self._layer_thread_suppress = self._layer_thread_suppress, True
-        self._layer_thread_suppress = True
-        self._canvas_item_composition.update_layout(Geometry.IntPoint(), canvas_size)
-        self._canvas_item_composition._repaint_children(drawing_context, immediate=True)
-        self._canvas_item_composition._repaint_cache(drawing_context)
-        self._layer_thread_suppress = layer_thread_suppress
-        self._canvas_item_composition._removed(None)
-        return True
+    def _repaint_layer_inner(self, drawing_context: DrawingContext.DrawingContext) -> None:
+        assert self.canvas_size is not None
+        composer = self._get_composer_inner(self._get_composer_cache())
+        canvas_rect = self.canvas_rect
+        if composer and canvas_rect:
+            composer.repaint(drawing_context, canvas_rect)
+
+    def repaint_immediate(self, drawing_context: DrawingContext.DrawingContext, canvas_size: Geometry.IntSize) -> None:
+        # repaint assumes that the canvas item being repainted already has a canvas rect.
+        # to ensure it does, call _update_layout here.
+        composer = self.get_composer_immediate(self._get_composer_cache())
+        if composer:
+            # the "immediate" composer has composer for all children, including those of any layers in the hierarchy,
+            # so it can be used to repaint immediate.
+            composer.update_layout(Geometry.IntPoint(), canvas_size)
+            if canvas_rect := self.canvas_rect:
+                composer.repaint(drawing_context, canvas_rect)
+
+    def __map_origin_to_root_container(self) -> typing.Optional[Geometry.IntPoint]:
+        """ Map the point to the coordinates of the root container.
+
+        This is different from default implementation in that it returns None if it fails.
+        """
+        p = Geometry.IntPoint()
+        canvas_item: typing.Optional[AbstractCanvasItem] = self
+        while canvas_item:  # handle case where last canvas item was root
+            canvas_item_origin = canvas_item.canvas_origin
+            if canvas_item_origin is not None:  # handle case where canvas item is not root but has no parent
+                p = canvas_item.map_to_container(p)
+                canvas_item = canvas_item.container
+            else:
+                return None
+        return p
 
     def __repaint_layer(self) -> None:
-        with self.__layer_thread_condition:
-            needs_repaint = self.__needs_repaint
-            self.__needs_repaint = False
-        if not self.__cancel and needs_repaint:
-            if self._canvas_item_composition._has_layout:
+        if not self.__cancel:
+            if self._has_layout:
                 try:
                     with Process.audit("repaint_layer"):
-                        self._canvas_item_composition._prepare_render()
-                        # layout or repaint that occurs during prepare render should be handled
-                        # but not trigger another repaint after this one.
-                        with self.__layer_thread_condition:
-                            self.__needs_repaint = False
+                        canvas_rect = self.canvas_rect
+                        root_container = self.root_container
+                        canvas_widget = typing.cast(CanvasWidgetCanvasItem, root_container) if isinstance(root_container, CanvasWidgetCanvasItem) else None
                         drawing_context = DrawingContext.DrawingContext()
-                        self._canvas_item_composition._repaint_children(drawing_context)
-                        self._canvas_item_composition._repaint_cache(drawing_context)
-                        with self.__layer_lock:
-                            self.__layer_seed += 1
-                            self.__layer_drawing_context = drawing_context
+                        is_root_opaque = self.is_root_opaque
+                        if is_root_opaque and canvas_widget and canvas_rect:
+                            # if direct drawing is used, configure the drawing context to draw directly to the canvas
+                            # widget section at the location 0,0.
+                            drawing_context.translate(-canvas_rect.left, -canvas_rect.top)
+                        self._repaint_layer_inner(drawing_context)
                         if not self.__cancel:
-                            self._canvas_item_composition._repaint_finished(self.__layer_drawing_context)
+                            if is_root_opaque and canvas_widget and canvas_rect:
+                                # if direct drawing is used, draw the drawing context to the canvas widget section.
+                                if not self.__canvas_widget_section_ref:
+                                    # create a section ref, which allows direct drawing for top level opaque items.
+                                    # the section is automatically deallocated (via finalize) when the last python
+                                    # reference to the section is released.
+                                    self.__canvas_widget_section_ref = canvas_widget.get_section_ref()
+                                # draw top level opaque item directly. ensure the proper canvas rect.
+                                assert self.__canvas_widget_section_ref
+                                # get the canvas origin; but wait until the root container is ready.
+                                # this layout may occur faster than the root layout.
+                                canvas_origin = self.__map_origin_to_root_container()
+                                while not canvas_origin:
+                                    time.sleep(0.01)
+                                    canvas_origin = self.__map_origin_to_root_container()
+                                canvas_rect = Geometry.IntRect(origin=canvas_origin, size=canvas_rect.size)
+                                self.__canvas_widget_section_ref.draw(drawing_context, canvas_rect)
+                            else:
+                                # if this is a normal layer that is not top level opaque, then the drawing context
+                                # is saved and the container is asked to update after which it will return a composer
+                                # with the drawing context. if this is a root layer, then the drawing context is
+                                # directly updated to the canvas widget.
+                                self._repaint_finished(drawing_context)
                 except Exception as e:
                     import traceback
                     logging.debug("CanvasItem Render Error: %s", e)
@@ -2232,25 +2471,42 @@ class LayerLayoutRenderTrait(CompositionLayoutRenderTrait):
                     traceback.print_stack()
 
 
-class LayerCanvasItem(CanvasItemComposition):
-    """A composite canvas item that does layout and repainting in a thread."""
-
-    def __init__(self) -> None:
-        super().__init__(LayerLayoutRenderTrait(self))
-
-
 class ScrollAreaLayout(CanvasItemLayout):
-    def __init__(self) -> None:
+    def __init__(self, auto_resize_contents: bool = False) -> None:
         super().__init__()
-        self.auto_resize_contents = False
+        self.auto_resize_contents = auto_resize_contents
+
+    def copy(self) -> CanvasItemAbstractLayout:
+        return ScrollAreaLayout(self.auto_resize_contents)
 
     def layout(self, canvas_origin: Geometry.IntPoint, canvas_size: Geometry.IntSize, canvas_items: typing.Sequence[LayoutItem]) -> None:
         content = canvas_items[0] if canvas_items else None
         if content:
-            if not content._has_layout:
-                self.update_canvas_item_layout(Geometry.IntPoint(), canvas_size, content)
-            elif self.auto_resize_contents:
+            if self.auto_resize_contents:
                 self.update_canvas_item_layout(canvas_origin, canvas_size, content)
+            elif not content._has_layout:
+                self.update_canvas_item_layout(Geometry.IntPoint(), content.layout_sizing.get_preferred_size(), content)
+
+
+class ScrollAreaCanvasItemComposer(CanvasItemCompositionComposer):
+    def __init__(self,
+                 canvas_item: AbstractCanvasItem,
+                 layout_sizing: Sizing,
+                 composer_cache: ComposerCache,
+                 layout: CanvasItemAbstractLayout,
+                 child_composers: typing.Sequence[BaseComposer],
+                 background_color: typing.Optional[typing.Union[str, DrawingContext.LinearGradient]],
+                 border_color: typing.Optional[str],
+                 content_origin: Geometry.IntPoint) -> None:
+        super().__init__(canvas_item, layout_sizing, composer_cache, layout, child_composers, background_color, border_color)
+        self.__content_origin = content_origin
+
+    def _repaint_children(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, child_composers: typing.Sequence[BaseComposer]) -> None:
+        with drawing_context.saver():
+            content_origin = self.__content_origin
+            drawing_context.clip_rect(canvas_bounds.left, canvas_bounds.top, canvas_bounds.width, canvas_bounds.height)
+            drawing_context.translate(content_origin.x, content_origin.y)
+            super()._repaint_children(drawing_context, canvas_bounds, child_composers)
 
 
 class ScrollAreaCanvasItem(CanvasItemComposition):
@@ -2317,15 +2573,19 @@ class ScrollAreaCanvasItem(CanvasItemComposition):
         # for testing.
         return Geometry.IntRect(origin=self.content_origin, size=self.content_size or Geometry.IntSize())
 
-    def update_content_origin(self, new_content_origin: Geometry.IntPoint) -> None:
+    def update_content_origin(self, new_content_origin: Geometry.IntPoint) -> bool:
         """Update the content origin, restricting it to a valid range."""
         content_size = self.content_size or Geometry.IntSize()
         canvas_size = self.canvas_size or Geometry.IntSize()
         cx = max(-(content_size.width - canvas_size.width), min(0, new_content_origin.x)) if content_size.width > canvas_size.width else 0
         cy = max(-(content_size.height - canvas_size.height), min(0, new_content_origin.y)) if content_size.height > canvas_size.height else 0
-        self.__content_origin = Geometry.IntPoint(x=cx, y=cy)
-        self.content_updated_event.fire()
-        self.update()
+        content_origin = Geometry.IntPoint(x=cx, y=cy)
+        if self.__content_origin != content_origin:
+            self.__content_origin = content_origin
+            self.content_updated_event.fire()
+            self.update()
+            return True
+        return False
 
     def make_selection_visible(self, min_rect: Geometry.IntRect, max_rect: Geometry.IntRect, adjust_horizontal: bool, adjust_vertical: bool, prefer_min: bool) -> None:
         canvas_origin = self.canvas_origin
@@ -2373,19 +2633,8 @@ class ScrollAreaCanvasItem(CanvasItemComposition):
             # matches the scroll position.
             self.update_content_origin(self.__content_origin)
 
-    def _repaint_children(self, drawing_context: DrawingContext.DrawingContext, *, immediate: bool = False) -> None:
-        # paint the children with the content origin and a clip rect.
-        with drawing_context.saver():
-            canvas_origin = self.canvas_origin
-            canvas_size = self.canvas_size
-            if canvas_origin and canvas_size:
-                drawing_context.clip_rect(canvas_origin.x, canvas_origin.y, canvas_size.width, canvas_size.height)
-                content = self.content
-                content_origin = self.content_origin
-                if content and content_origin:
-                    drawing_context.translate(content_origin.x, content_origin.y)
-                    visible_rect = Geometry.IntRect(origin=-content_origin, size=canvas_size)
-                    content._repaint_visible(drawing_context, visible_rect)
+    def _get_composition_composer(self, child_composers: typing.Sequence[BaseComposer], composer_cache: ComposerCache) -> BaseComposer:
+        return ScrollAreaCanvasItemComposer(self, self.layout_sizing, composer_cache, self.layout, child_composers, self.background_color, self.border_color, self.__content_origin)
 
     def map_to_container(self, p: Geometry.IntPoint) -> Geometry.IntPoint:
         return super().map_to_container(p + self.content_origin)
@@ -2427,18 +2676,20 @@ class ScrollAreaCanvasItem(CanvasItemComposition):
 
 
 class SplitterLayout(CanvasItemLayout):
-    def __init__(self, orientation: str) -> None:
-        super().__init__()
+    def __init__(self, orientation: str, margins: typing.Optional[Geometry.Margins] = None, spacing: typing.Optional[int] = None, sizings: typing.Optional[typing.Sequence[Sizing]] = None) -> None:
+        super().__init__(margins, spacing)
         self.__orientation = orientation
-        self.__sizings: typing.List[Sizing] = list()
+        self.__sizings = list(sizings) if sizings else list[Sizing]()
+
+    def copy(self) -> CanvasItemAbstractLayout:
+        return SplitterLayout(self.__orientation, self.margins, self.spacing, self.__sizings)
 
     @property
     def sizings(self) -> typing.Sequence[Sizing]:
         return self.__sizings
 
-    @sizings.setter
-    def sizings(self, value: typing.Sequence[Sizing]) -> None:
-        self.__sizings = list(value)
+    def with_sizings(self, sizings: typing.Sequence[Sizing]) -> SplitterLayout:
+        return SplitterLayout(self.__orientation, self.margins, self.spacing, sizings)
 
     def layout(self, canvas_origin: Geometry.IntPoint, canvas_size: Geometry.IntSize, canvas_items: typing.Sequence[LayoutItem]) -> None:
         sizings = self.sizings
@@ -2457,6 +2708,38 @@ class SplitterLayout(CanvasItemLayout):
                     canvas_item_size = Geometry.IntSize(height=canvas_size.height, width=size)
                     canvas_item.update_layout(canvas_item_origin, canvas_item_size)
                     assert canvas_item._has_layout
+
+
+class SplitterCanvasItemComposer(CanvasItemCompositionComposer):
+    def __init__(self,
+                 canvas_item: AbstractCanvasItem,
+                 layout_sizing: Sizing,
+                 composer_cache: ComposerCache,
+                 layout: CanvasItemAbstractLayout,
+                 child_composers: typing.Sequence[BaseComposer],
+                 background_color: typing.Optional[typing.Union[str, DrawingContext.LinearGradient]],
+                 border_color: typing.Optional[str],
+                 orientation: str) -> None:
+        super().__init__(canvas_item, layout_sizing, composer_cache, layout, child_composers, background_color, border_color)
+        self.__child_composers = child_composers
+        self.__orientation = orientation
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        super()._repaint(drawing_context, canvas_bounds, composer_cache)
+        # this section is only to draw the splitter lines.
+        with drawing_context.saver():
+            drawing_context.begin_path()
+            for child_composer in self.__child_composers[1:]:
+                child_canvas_origin = child_composer._canvas_bounds.origin
+                if self.__orientation == "horizontal":
+                    drawing_context.move_to(canvas_bounds.left, child_canvas_origin.y)
+                    drawing_context.line_to(canvas_bounds.right, child_canvas_origin.y)
+                else:
+                    drawing_context.move_to(child_canvas_origin.x, canvas_bounds.top)
+                    drawing_context.line_to(child_canvas_origin.x, canvas_bounds.bottom)
+            drawing_context.line_width = 0.5
+            drawing_context.stroke_style = "#666"
+            drawing_context.stroke()
 
 
 class SplitterCanvasItem(CanvasItemComposition):
@@ -2530,8 +2813,9 @@ class SplitterCanvasItem(CanvasItemComposition):
                 sizings[index] = sizing.with_preferred_width(split)
         with self.__lock:
             self.__sizings = sizings
-            self.__splitter_layout.sizings = self.__sizings
-        self.refresh_layout()
+            self.__splitter_layout = self.__splitter_layout.with_sizings(self.__sizings)
+            self.layout = self.__splitter_layout
+        self.update()
 
     def _insert_canvas_item_x(self, before_index: int, canvas_item: AbstractCanvasItem) -> None:
         sizing_data = SizingData()
@@ -2545,14 +2829,18 @@ class SplitterCanvasItem(CanvasItemComposition):
                 sizing_data.minimum_width = 0.1
         with self.__lock:
             self.__sizings.insert(before_index, Sizing(sizing_data))
-            self.__splitter_layout.sizings = self.__sizings
+            self.__splitter_layout = self.__splitter_layout.with_sizings(self.__sizings)
+            self.layout = self.__splitter_layout
         super()._insert_canvas_item_x(before_index, canvas_item)
+        self.update()
 
     def _remove_canvas_item_direct(self, canvas_item: AbstractCanvasItem) -> None:
         with self.__lock:
             del self.__sizings[self.canvas_items.index(canvas_item)]
-            self.__splitter_layout.sizings = self.__sizings
+            self.__splitter_layout = self.__splitter_layout.with_sizings(self.__sizings)
+            self.layout = self.__splitter_layout
         super()._remove_canvas_item_direct(canvas_item)
+        self.update()
 
     def canvas_items_at_point(self, x: int, y: int) -> typing.List[AbstractCanvasItem]:
         if self.orientation == "horizontal":
@@ -2577,24 +2865,8 @@ class SplitterCanvasItem(CanvasItemComposition):
     def _did_unwrap_child_canvas_item(self, state: typing.Any) -> typing.Any:
         self.splits = typing.cast(typing.Sequence[float], state)
 
-    def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        super()._repaint(drawing_context)
-        canvas_bounds = self.canvas_bounds
-        assert canvas_bounds is not None
-        with drawing_context.saver():
-            drawing_context.begin_path()
-            for canvas_item in self.canvas_items[1:]:  # don't check the '0' origin
-                child_canvas_origin = canvas_item.canvas_origin
-                if child_canvas_origin:
-                    if self.orientation == "horizontal":
-                        drawing_context.move_to(canvas_bounds.left, child_canvas_origin.y)
-                        drawing_context.line_to(canvas_bounds.right, child_canvas_origin.y)
-                    else:
-                        drawing_context.move_to(child_canvas_origin.x, canvas_bounds.top)
-                        drawing_context.line_to(child_canvas_origin.x, canvas_bounds.bottom)
-            drawing_context.line_width = 0.5
-            drawing_context.stroke_style = "#666"
-            drawing_context.stroke()
+    def _get_composition_composer(self, child_composers: typing.Sequence[BaseComposer], composer_cache: ComposerCache) -> BaseComposer:
+        return SplitterCanvasItemComposer(self, self.layout_sizing, composer_cache, self.__splitter_layout, child_composers, self.background_color, self.border_color, self.orientation)
 
     def __hit_test(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> typing.Tuple[str, int, int]:
         if self._has_layout:
@@ -2638,8 +2910,9 @@ class SplitterCanvasItem(CanvasItemComposition):
             # update the layout
             with self.__lock:
                 self.__sizings = new_sizings
-                self.__splitter_layout.sizings = self.__sizings
-            self.refresh_layout()
+                self.__splitter_layout = self.__splitter_layout.with_sizings(self.__sizings)
+                self.layout = self.__splitter_layout
+            self.update()
             return True
         return super().mouse_pressed(x, y, modifiers)
 
@@ -2663,8 +2936,9 @@ class SplitterCanvasItem(CanvasItemComposition):
             new_sizings.append(Sizing(sizing_data))
         with self.__lock:
             self.__sizings = new_sizings
-            self.__splitter_layout.sizings = self.__sizings
-        self.refresh_layout()
+            self.__splitter_layout = self.__splitter_layout.with_sizings(self.__sizings)
+            self.layout = self.__splitter_layout
+        self.update()
         if callable(self.on_splits_changed):
             self.on_splits_changed()
         return True
@@ -2704,8 +2978,9 @@ class SplitterCanvasItem(CanvasItemComposition):
                     new_sizings[self.__tracking_start_index + 1] = new_sizings[self.__tracking_start_index + 1].with_preferred_width(tracking_start_preferred_next - offset)
             with self.__lock:
                 self.__sizings = new_sizings
-                self.__splitter_layout.sizings = self.__sizings
-            self.refresh_layout()
+                self.__splitter_layout = self.__splitter_layout.with_sizings(self.__sizings)
+                self.layout = self.__splitter_layout
+            self.update()
             return True
         else:
             control, _, _ = self.__hit_test(x, y, modifiers)
@@ -2718,13 +2993,50 @@ class SplitterCanvasItem(CanvasItemComposition):
             return super().mouse_position_changed(x, y, modifiers)
 
 
+SLIDER_THUMB_WIDTH = 8
+SLIDER_THUMB_HEIGHT = 16
+SLIDER_BAR_OFFSET = 1
+SLIDER_BAR_HEIGHT = 4
+
+
+def get_slider_bar_rect(canvas_size: typing.Optional[Geometry.IntSize]) -> Geometry.FloatRect:
+    if canvas_size:
+        bar_width = canvas_size.width - SLIDER_THUMB_WIDTH - SLIDER_BAR_OFFSET * 2
+        return Geometry.FloatRect.from_tlhw(canvas_size.height / 2 - SLIDER_BAR_HEIGHT / 2, SLIDER_BAR_OFFSET + SLIDER_THUMB_WIDTH / 2, SLIDER_BAR_HEIGHT, bar_width)
+    return Geometry.FloatRect.empty_rect()
+
+def get_slider_thumb_rect(canvas_size: typing.Optional[Geometry.IntSize], value: float) -> Geometry.IntRect:
+    if canvas_size:
+        bar_width = canvas_size.width - SLIDER_THUMB_WIDTH - SLIDER_BAR_OFFSET * 2
+        # use tracking value to avoid thumb jumping around while dragging, which occurs when value gets integerized and set.
+        return Geometry.FloatRect.from_tlhw(canvas_size.height / 2 - SLIDER_THUMB_HEIGHT / 2, value * bar_width + SLIDER_BAR_OFFSET, SLIDER_THUMB_HEIGHT, SLIDER_THUMB_WIDTH).to_int_rect()
+    return Geometry.IntRect.empty_rect()
+
+
+class SliderCanvasItemComposer(BaseComposer):
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, cache: ComposerCache, value: float) -> None:
+        super().__init__(canvas_item, layout_sizing, cache)
+        self.__value = value
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        thumb_rect = get_slider_thumb_rect(canvas_bounds.size, self.__value)
+        bar_rect = get_slider_bar_rect(canvas_bounds.size)
+        with drawing_context.saver():
+            drawing_context.translate(canvas_bounds.left, canvas_bounds.top)
+            drawing_context.begin_path()
+            drawing_context.rect(bar_rect.left, bar_rect.top, bar_rect.width, bar_rect.height)
+            drawing_context.fill_style = "#CCC"
+            drawing_context.fill()
+            drawing_context.stroke_style = "#888"
+            drawing_context.stroke()
+            drawing_context.begin_path()
+            drawing_context.rect(thumb_rect.left, thumb_rect.top, thumb_rect.width, thumb_rect.height)
+            drawing_context.fill_style = "#007AD8"
+            drawing_context.fill()
+
+
 class SliderCanvasItem(AbstractCanvasItem, Observable.Observable):
     """Slider."""
-    thumb_width = 8
-    thumb_height = 16
-    bar_offset = 1
-    bar_height = 4
-
     def __init__(self) -> None:
         super().__init__()
         self.wants_mouse_events = True
@@ -2753,45 +3065,12 @@ class SliderCanvasItem(AbstractCanvasItem, Observable.Observable):
             self.update()
             self.notify_property_changed("value")
 
-    def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        thumb_rect = self.__get_thumb_rect()
-        bar_rect = self.__get_bar_rect()
-        with drawing_context.saver():
-            drawing_context.begin_path()
-            drawing_context.rect(bar_rect.left, bar_rect.top, bar_rect.width, bar_rect.height)
-            drawing_context.fill_style = "#CCC"
-            drawing_context.fill()
-            drawing_context.stroke_style = "#888"
-            drawing_context.stroke()
-            drawing_context.begin_path()
-            drawing_context.rect(thumb_rect.left, thumb_rect.top, thumb_rect.width, thumb_rect.height)
-            drawing_context.fill_style = "#007AD8"
-            drawing_context.fill()
-
-    def __get_bar_rect(self) -> Geometry.FloatRect:
-        canvas_size = self.canvas_size
-        if canvas_size:
-            thumb_width = self.thumb_width
-            bar_offset = self.bar_offset
-            bar_width = canvas_size.width - thumb_width - bar_offset * 2
-            bar_height = self.bar_height
-            return Geometry.FloatRect.from_tlhw(canvas_size.height / 2 - bar_height / 2, bar_offset + thumb_width / 2, bar_height, bar_width)
-        return Geometry.FloatRect.empty_rect()
-
-    def __get_thumb_rect(self) -> Geometry.IntRect:
-        canvas_size = self.canvas_size
-        if canvas_size:
-            thumb_width = self.thumb_width
-            thumb_height = self.thumb_height
-            bar_offset = self.bar_offset
-            bar_width = canvas_size.width - thumb_width - bar_offset * 2
-            # use tracking value to avoid thumb jumping around while dragging, which occurs when value gets integerized and set.
-            value = self.value if not self.__tracking else self.__tracking_value
-            return Geometry.FloatRect.from_tlhw(canvas_size.height / 2 - thumb_height / 2, value * bar_width + bar_offset, thumb_height, thumb_width).to_int_rect()
-        return Geometry.IntRect.empty_rect()
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        value = self.value if not self.__tracking else self.__tracking_value
+        return SliderCanvasItemComposer(self, self.layout_sizing, composer_cache, value)
 
     def mouse_pressed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        thumb_rect = self.__get_thumb_rect()
+        thumb_rect = get_slider_thumb_rect(self.canvas_size, self.value)
         pos = Geometry.IntPoint(x=x, y=y)
         if thumb_rect.inset(-2, -2).contains_point(pos):
             self.__tracking = True
@@ -2819,7 +3098,7 @@ class SliderCanvasItem(AbstractCanvasItem, Observable.Observable):
     def mouse_position_changed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
         if self.__tracking:
             pos = Geometry.FloatPoint(x=x, y=y)
-            bar_rect = self.__get_bar_rect()
+            bar_rect = get_slider_bar_rect(self.canvas_size)
             value = (pos.x - bar_rect.left) / bar_rect.width
             self.__tracking_value = max(0.0, min(1.0, value))
             self.value = value
@@ -2831,12 +3110,132 @@ class SliderCanvasItem(AbstractCanvasItem, Observable.Observable):
         self.value_change_stream.end()
 
 
-PositionLength = collections.namedtuple("PositionLength", ["position", "length"])
+@dataclasses.dataclass
+class PositionLength:
+    position: int
+    length: int
+
+
+def get_thumb_position_and_length(canvas_length: int, visible_length: int, content_length: int, content_offset: int) -> PositionLength:
+    """
+        Return the thumb position and length as a tuple of ints.
+
+        The canvas_length is the size of the canvas of the scroll bar.
+
+        The visible_length is the size of the visible area of the scroll area.
+
+        The content_length is the size of the content of the scroll area.
+
+        The content_offset is the position of the content within the scroll area. It
+        will always be negative or zero.
+    """
+    # the scroll_range defines the maximum negative value of the content_offset.
+    scroll_range = max(content_length - visible_length, 0)
+    # content_offset should be negative, but not more negative than the scroll_range.
+    content_offset = max(-scroll_range, min(0, content_offset))
+    # assert content_offset <= 0 and content_offset >= -scroll_range
+    # the length of the thumb is the visible_length multiplied by the ratio of
+    # visible_length to the content_length. however, a minimum height is enforced
+    # so that the user can always grab it. if the thumb is invisible (the content_length
+    # is less than or equal to the visible_length) then the thumb will have a length of zero.
+    if content_length > visible_length:
+        thumb_length = int(canvas_length * (float(visible_length) / content_length))
+        thumb_length = max(thumb_length, 32)
+        # the position of the thumb is the content_offset over the content_length multiplied by
+        # the free-range of the thumb which is the canvas_length minus the thumb_length.
+        thumb_position = int((canvas_length - thumb_length) * (float(-content_offset) / scroll_range))
+    else:
+        thumb_length = 0
+        thumb_position = 0
+    return PositionLength(thumb_position, thumb_length)
+
+
+def get_thumb_rect(canvas_size: Geometry.IntSize, orientation: Orientation, content_rect: Geometry.IntRect) -> Geometry.IntRect:
+    # return the thumb rect for the given canvas_size
+    index = 0 if orientation == Orientation.Vertical else 1
+    scroll_area_content_origin = content_rect.origin
+    scroll_area_content_size = content_rect.size
+    if scroll_area_content_size.width and scroll_area_content_size.height:
+        visible_length = canvas_size[index]
+        content_length = scroll_area_content_size[index]
+        content_offset = scroll_area_content_origin[index]
+        thumb_position_length = get_thumb_position_and_length(canvas_size[index], visible_length, content_length, content_offset)
+        if orientation == Orientation.Vertical:
+            thumb_origin = Geometry.IntPoint(x=0, y=thumb_position_length.position)
+            thumb_size = Geometry.IntSize(width=canvas_size.width, height=thumb_position_length.length)
+        else:
+            thumb_origin = Geometry.IntPoint(x=thumb_position_length.position, y=0)
+            thumb_size = Geometry.IntSize(width=thumb_position_length.length, height=canvas_size.height)
+        return Geometry.IntRect(origin=thumb_origin, size=thumb_size)
+    return Geometry.IntRect.empty_rect()
+
+
+class ScrollBarCanvasItemComposer(BaseComposer):
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, cache: ComposerCache, orientation: Orientation, content_rect: Geometry.IntRect, is_tracking: bool) -> None:
+        super().__init__(canvas_item, layout_sizing, cache)
+        self.__orientation = orientation
+        self.__content_rect = content_rect
+        self.__is_tracking = is_tracking
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        # canvas size, thumb rect
+        orientation = self.__orientation
+        is_tracking = self.__is_tracking
+        thumb_rect = get_thumb_rect(canvas_bounds.size, self.__orientation, self.__content_rect)
+        # draw it
+        with drawing_context.saver():
+            # draw the border of the scroll bar
+            drawing_context.translate(canvas_bounds.left, canvas_bounds.top)
+            drawing_context.begin_path()
+            drawing_context.rect(0, 0, canvas_bounds.width, canvas_bounds.height)
+            if orientation == Orientation.Vertical:
+                gradient = drawing_context.create_linear_gradient(canvas_bounds.width, canvas_bounds.height, 0, 0, canvas_bounds.width, 0)
+            else:
+                gradient = drawing_context.create_linear_gradient(canvas_bounds.width, canvas_bounds.height, 0, 0, 0, canvas_bounds.height)
+            gradient.add_color_stop(0.0, "#F2F2F2")
+            gradient.add_color_stop(0.35, "#FDFDFD")
+            gradient.add_color_stop(0.65, "#FDFDFD")
+            gradient.add_color_stop(1.0, "#F2F2F2")
+            drawing_context.fill_style = gradient
+            drawing_context.fill()
+            # draw the thumb, if any
+            if thumb_rect.height > 0 and thumb_rect.width > 0:
+                with drawing_context.saver():
+                    drawing_context.begin_path()
+                    if orientation == Orientation.Vertical:
+                        drawing_context.move_to(thumb_rect.width - 8, thumb_rect.top + 6)
+                        drawing_context.line_to(thumb_rect.width - 8, thumb_rect.bottom - 6)
+                    else:
+                        drawing_context.move_to(thumb_rect.left + 6, thumb_rect.height - 8)
+                        drawing_context.line_to(thumb_rect.right - 6, thumb_rect.height - 8)
+                    drawing_context.line_width = 8.0
+                    drawing_context.line_cap = "round"
+                    drawing_context.stroke_style = "#888" if is_tracking else "#CCC"
+                    drawing_context.stroke()
+            # draw inside edge
+            drawing_context.begin_path()
+            drawing_context.move_to(0, 0)
+            if orientation == Orientation.Vertical:
+                drawing_context.line_to(0, canvas_bounds.height)
+            else:
+                drawing_context.line_to(canvas_bounds.width, 0)
+            drawing_context.line_width = 0.5
+            drawing_context.stroke_style = "#E3E3E3"
+            drawing_context.stroke()
+            # draw outside
+            drawing_context.begin_path()
+            if orientation == Orientation.Vertical:
+                drawing_context.move_to(canvas_bounds.width, 0)
+            else:
+                drawing_context.move_to(0, canvas_bounds.height)
+            drawing_context.line_to(canvas_bounds.width, canvas_bounds.height)
+            drawing_context.line_width = 0.5
+            drawing_context.stroke_style = "#999999"
+            drawing_context.stroke()
 
 
 class ScrollBarCanvasItem(AbstractCanvasItem):
-
-    """ A scroll bar for a scroll area. """
+    """A scroll bar for a scroll area."""
 
     def __init__(self, scroll_area_canvas_item: ScrollAreaCanvasItem, orientation: typing.Optional[Orientation] = None) -> None:
         super().__init__()
@@ -2856,126 +3255,29 @@ class ScrollBarCanvasItem(AbstractCanvasItem):
         self.__scroll_area_canvas_item_content_updated_listener = typing.cast(typing.Any, None)
         super().close()
 
-    def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        # canvas size, thumb rect
-        canvas_size = self.canvas_size
-        thumb_rect = self.thumb_rect
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        return ScrollBarCanvasItemComposer(self, self.layout_sizing, composer_cache, self.__orientation, self.__scroll_area_canvas_item._content_rect, self.__tracking)
 
-        if canvas_size:
-            # draw it
-            with drawing_context.saver():
-                # draw the border of the scroll bar
-                drawing_context.begin_path()
-                drawing_context.rect(0, 0, canvas_size.width, canvas_size.height)
-                if self.__orientation == Orientation.Vertical:
-                    gradient = drawing_context.create_linear_gradient(canvas_size.width, canvas_size.height, 0, 0, canvas_size.width, 0)
-                else:
-                    gradient = drawing_context.create_linear_gradient(canvas_size.width, canvas_size.height, 0, 0, 0, canvas_size.height)
-                gradient.add_color_stop(0.0, "#F2F2F2")
-                gradient.add_color_stop(0.35, "#FDFDFD")
-                gradient.add_color_stop(0.65, "#FDFDFD")
-                gradient.add_color_stop(1.0, "#F2F2F2")
-                drawing_context.fill_style = gradient
-                drawing_context.fill()
-                # draw the thumb, if any
-                if thumb_rect.height > 0 and thumb_rect.width > 0:
-                    with drawing_context.saver():
-                        drawing_context.begin_path()
-                        if self.__orientation == Orientation.Vertical:
-                            drawing_context.move_to(thumb_rect.width - 8, thumb_rect.top + 6)
-                            drawing_context.line_to(thumb_rect.width - 8, thumb_rect.bottom - 6)
-                        else:
-                            drawing_context.move_to(thumb_rect.left + 6, thumb_rect.height - 8)
-                            drawing_context.line_to(thumb_rect.right - 6, thumb_rect.height - 8)
-                        drawing_context.line_width = 8.0
-                        drawing_context.line_cap = "round"
-                        drawing_context.stroke_style = "#888" if self.__tracking else "#CCC"
-                        drawing_context.stroke()
-                # draw inside edge
-                drawing_context.begin_path()
-                drawing_context.move_to(0, 0)
-                if self.__orientation == Orientation.Vertical:
-                    drawing_context.line_to(0, canvas_size.height)
-                else:
-                    drawing_context.line_to(canvas_size.width, 0)
-                drawing_context.line_width = 0.5
-                drawing_context.stroke_style = "#E3E3E3"
-                drawing_context.stroke()
-                # draw outside
-                drawing_context.begin_path()
-                if self.__orientation == Orientation.Vertical:
-                    drawing_context.move_to(canvas_size.width, 0)
-                else:
-                    drawing_context.move_to(0, canvas_size.height)
-                drawing_context.line_to(canvas_size.width, canvas_size.height)
-                drawing_context.line_width = 0.5
-                drawing_context.stroke_style = "#999999"
-                drawing_context.stroke()
-
-    def get_thumb_position_and_length(self, canvas_length: int, visible_length: int, content_length: int, content_offset: int) -> PositionLength:
-        """
-            Return the thumb position and length as a tuple of ints.
-
-            The canvas_length is the size of the canvas of the scroll bar.
-
-            The visible_length is the size of the visible area of the scroll area.
-
-            The content_length is the size of the content of the scroll area.
-
-            The content_offset is the position of the content within the scroll area. It
-            will always be negative or zero.
-        """
-        # the scroll_range defines the maximum negative value of the content_offset.
-        scroll_range = max(content_length - visible_length, 0)
-        # content_offset should be negative, but not more negative than the scroll_range.
-        content_offset = max(-scroll_range, min(0, content_offset))
-        # assert content_offset <= 0 and content_offset >= -scroll_range
-        # the length of the thumb is the visible_length multiplied by the ratio of
-        # visible_length to the content_length. however, a minimum height is enforced
-        # so that the user can always grab it. if the thumb is invisible (the content_length
-        # is less than or equal to the visible_length) then the thumb will have a length of zero.
-        if content_length > visible_length:
-            thumb_length = int(canvas_length * (float(visible_length) / content_length))
-            thumb_length = max(thumb_length, 32)
-            # the position of the thumb is the content_offset over the content_length multiplied by
-            # the free-range of the thumb which is the canvas_length minus the thumb_length.
-            thumb_position = int((canvas_length - thumb_length) * (float(-content_offset) / scroll_range))
-        else:
-            thumb_length = 0
-            thumb_position = 0
-        return PositionLength(thumb_position, thumb_length)
+    def __change_tracking(self, tracking: bool) -> None:
+        if self.__tracking != tracking:
+            self.__tracking = tracking
+            self.update()
 
     @property
     def thumb_rect(self) -> Geometry.IntRect:
         # return the thumb rect for the given canvas_size
         canvas_size = self.canvas_size
         if canvas_size:
-            index = 0 if self.__orientation == Orientation.Vertical else 1
-            scroll_area_canvas_size = self.__scroll_area_canvas_item.canvas_size
-            scroll_area_content_origin = self.__scroll_area_canvas_item.content_origin
-            scroll_area_content_size = self.__scroll_area_canvas_item.content_size
-            if scroll_area_content_size and scroll_area_canvas_size:
-                visible_length = scroll_area_canvas_size[index]
-                content_length = scroll_area_content_size[index]
-                content_offset = scroll_area_content_origin[index]
-                thumb_position, thumb_length = self.get_thumb_position_and_length(canvas_size[index], visible_length, content_length, content_offset)
-                if self.__orientation == Orientation.Vertical:
-                    thumb_origin = Geometry.IntPoint(x=0, y=thumb_position)
-                    thumb_size = Geometry.IntSize(width=canvas_size.width, height=thumb_length)
-                else:
-                    thumb_origin = Geometry.IntPoint(x=thumb_position, y=0)
-                    thumb_size = Geometry.IntSize(width=thumb_length, height=canvas_size.height)
-                return Geometry.IntRect(origin=thumb_origin, size=thumb_size)
+            return get_thumb_rect(canvas_size, self.__orientation, self.__scroll_area_canvas_item._content_rect)
         return Geometry.IntRect.empty_rect()
 
     def mouse_pressed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
         thumb_rect = self.thumb_rect
         pos = Geometry.IntPoint(x=x, y=y)
         if thumb_rect.contains_point(pos):
-            self.__tracking = True
+            self.__change_tracking(True)
             self.__tracking_start = pos
             self.__tracking_content_origin = self.__scroll_area_canvas_item.content_origin or Geometry.IntPoint()
-            self.update()
             return True
         elif self.__orientation == Orientation.Vertical and y < thumb_rect.top:
             self.__adjust_thumb(-1)
@@ -2992,8 +3294,7 @@ class ScrollBarCanvasItem(AbstractCanvasItem):
         return super().mouse_pressed(x, y, modifiers)
 
     def mouse_released(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        self.__tracking = False
-        self.update()
+        self.__change_tracking(False)
         return super().mouse_released(x, y, modifiers)
 
     def __adjust_thumb(self, amount: float) -> None:
@@ -3026,8 +3327,8 @@ class ScrollBarCanvasItem(AbstractCanvasItem):
             The mouse_offset is the offset of the mouse.
         """
         scroll_range = max(content_length - visible_length, 0)
-        _, thumb_length = self.get_thumb_position_and_length(canvas_length, visible_length, content_length, content_origin)
-        offset_rel = int(scroll_range * float(mouse_offset) / (canvas_length - thumb_length))
+        thumb_position_length = get_thumb_position_and_length(canvas_length, visible_length, content_length, content_origin)
+        offset_rel = int(scroll_range * float(mouse_offset) / (canvas_length - thumb_position_length.length))
         return max(min(content_origin - offset_rel, 0), -scroll_range)
 
     def mouse_position_changed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
@@ -3052,83 +3353,18 @@ class ScrollBarCanvasItem(AbstractCanvasItem):
                             content_width = scroll_area_content_canvas_size[1]
                             new_content_origin_h = self.adjust_content_origin(canvas_size[1], visible_width, content_width, tracking_content_origin[1], mouse_offset_h)
                             new_content_origin = Geometry.IntPoint(x=new_content_origin_h, y=tracking_content_origin[0])
-                        self.__scroll_area_canvas_item.update_content_origin(new_content_origin)
-                        self.update()
+                        if self.__scroll_area_canvas_item.update_content_origin(new_content_origin):
+                            self.update()
         return super().mouse_position_changed(x, y, modifiers)
 
 
-class RootLayoutRenderTrait(CompositionLayoutRenderTrait):
+class CanvasWidgetSection:
 
-    next_section_id = 0
-
-    def __init__(self, canvas_item_composition: CanvasItemComposition) -> None:
-        super().__init__(canvas_item_composition)
-        self.__section_ids_lock = threading.RLock()
-        self.__section_map: typing.Dict[AbstractCanvasItem, int] = dict()
-        self.__layout_lock = threading.RLock()
-
-    def close(self) -> None:
-        with self.__section_ids_lock:
-            section_map = self.__section_map
-            self.__section_map = dict()
-            for section_id in section_map.values():
-                canvas_widget = self._canvas_item_composition.canvas_widget
-                if canvas_widget:
-                    canvas_widget.remove_section(section_id)
-        super().close()
-
-    def _redraw(self) -> None:
-        with self.__section_ids_lock:
-            section_map = self.__section_map
-            self.__section_map = dict()
-            for section_id in section_map.values():
-                canvas_widget = self._canvas_item_composition.canvas_widget
-                if canvas_widget:
-                    canvas_widget.remove_section(section_id)
-        for canvas_item in self._canvas_item_composition.get_root_opaque_canvas_items():
-            canvas_item.sync_redraw()
-            canvas_item.refresh_layout()
-            canvas_item.update()
-
-    def _try_update_with_items(self, canvas_items: typing.Optional[typing.Sequence[AbstractCanvasItem]] = None) -> bool:
-        # thread-safe
-        drawing_context = DrawingContext.DrawingContext()
-        if self._canvas_item_composition._has_layout and self._canvas_item_composition.canvas_widget and canvas_items:
-            for canvas_item in canvas_items:
-                if canvas_item.is_root_opaque:
-                    self._canvas_item_composition._update_count += 1
-                    canvas_size = canvas_item.canvas_size
-                    if canvas_size:
-                        canvas_rect = Geometry.IntRect(canvas_item.map_to_root_container(Geometry.IntPoint(0, 0)), canvas_size)
-                        canvas_item._repaint_template(drawing_context, immediate=False)
-                        drawing_context.translate(-canvas_rect.left, -canvas_rect.top)
-                        with self.__section_ids_lock:
-                            section_id = self.__section_map.get(canvas_item, None)
-                            if not section_id:
-                                RootLayoutRenderTrait.next_section_id += 1
-                                section_id = RootLayoutRenderTrait.next_section_id
-                                self.__section_map[canvas_item] = section_id
-                        self._canvas_item_composition.canvas_widget.draw_section(section_id, drawing_context, canvas_rect)
-                    # break
-        self.__cull_unused_sections()
-        return True
-
-    def __cull_unused_sections(self) -> None:
-        canvas_items = self._canvas_item_composition.get_root_opaque_canvas_items()
-        with self.__section_ids_lock:
-            section_map = self.__section_map
-            self.__section_map = dict()
-            for canvas_item in canvas_items:
-                section_id = section_map.pop(canvas_item, None)
-                if section_id:
-                    self.__section_map[canvas_item] = section_id
-        for section_id in section_map.values():
-            canvas_widget = self._canvas_item_composition.canvas_widget
-            if canvas_widget:
-                canvas_widget.remove_section(section_id)
+    def draw(self, drawing_context: DrawingContext.DrawingContext, canvas_rect: Geometry.IntRect) -> None:
+        raise NotImplementedError()
 
 
-class CanvasWidgetCanvasItem(CanvasItemComposition):
+class CanvasWidgetCanvasItem(LayerCanvasItem):
     """Internal class to represent a composition with a canvas widget."""
 
     @property
@@ -3142,9 +3378,11 @@ class CanvasWidgetCanvasItem(CanvasItemComposition):
     @abc.abstractmethod
     def size_changed(self, width: int, height: int) -> None: ...
 
+    @abc.abstractmethod
+    def get_section_ref(self) -> CanvasWidgetSection: ...
+
 
 RootLayoutRender = "root"
-DefaultLayoutRender: typing.Optional[str] = None
 
 
 class RootCanvasItem(CanvasWidgetCanvasItem):
@@ -3161,8 +3399,10 @@ class RootCanvasItem(CanvasWidgetCanvasItem):
     root canvas item's hierarchy.
     """
 
-    def __init__(self, canvas_widget: UserInterface.CanvasWidget, *, layout_render: typing.Optional[str] = DefaultLayoutRender) -> None:
-        super().__init__(RootLayoutRenderTrait(self) if layout_render == RootLayoutRender and _threaded_rendering_enabled else LayerLayoutRenderTrait(self))
+    next_section_id = 0
+
+    def __init__(self, canvas_widget: UserInterface.CanvasWidget, **kwargs: typing.Any) -> None:
+        super().__init__()
         self.__canvas_widget = canvas_widget
         self.__canvas_widget.on_size_changed = self.size_changed
         self.__canvas_widget.on_mouse_clicked = self.__mouse_clicked
@@ -3199,8 +3439,6 @@ class RootCanvasItem(CanvasWidgetCanvasItem):
         self.__drag_tracking_canvas_item: typing.Optional[AbstractCanvasItem] = None
         self.__grab_canvas_item: typing.Optional[MouseTrackingCanvasItem.TrackingCanvasItem] = None
         self._set_canvas_origin(Geometry.IntPoint())
-        # used for checking that refresh layout is not called from within a layout update
-        self.__update_child_item_layout_count = 0
 
     def close(self) -> None:
         # shut down the repaint thread first
@@ -3234,25 +3472,46 @@ class RootCanvasItem(CanvasWidgetCanvasItem):
         # culling will require the canvas widget; clear it here (after close) so that it is availahle.
         self.__canvas_widget = typing.cast(typing.Any, None)
 
+    def get_composer(self, cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        # layer overrides this; need to override here to implement it as it would be implemented in the parent class
+        # of the layer.
+        return self._get_composer_inner(cache)
+
+    def _repaint_layer_inner(self, drawing_context: DrawingContext.DrawingContext) -> None:
+        # layer introduces this; need to override here so that root items use regular repaint and not the non-root
+        # layer painting. items under non-root layer have layout specific to the layer, but root children can use
+        # regular layout.
+        super()._repaint(drawing_context)
+
     def _repaint_finished(self, drawing_context: DrawingContext.DrawingContext) -> None:
         self.__canvas_widget.draw(drawing_context)
 
-    def refresh_layout(self) -> None:
-        if self.canvas_size:
-            self.update_layout(self.canvas_origin, self.canvas_size)
+    def get_section_ref(self) -> CanvasWidgetSection:
+        """Return a section ref object for direct top level drawing.
 
-    def _update_child_item_layout(self, child_item: AbstractCanvasItem) -> None:
-        if self.__update_child_item_layout_count:
-            logging.debug("update_child_item_layout called from within a layout update")
-            import traceback
-            traceback.print_stack()
-            return
-        self.__update_child_item_layout_count += 1
-        try:
-            if self.canvas_size:
-                self._update_child_layouts(self.canvas_size)
-        finally:
-            self.__update_child_item_layout_count -= 1
+        The section can be removed for efficiency by eliminating all references to the section ref.
+        """
+
+        class RootCanvasWidgetSection(CanvasWidgetSection):
+            def __init__(self, root_canvas_item: RootCanvasItem, section_id: int) -> None:
+                self.__root_canvas_item_ref = weakref.ref(root_canvas_item)
+                self._section_id = section_id
+
+                def finalize(root_canvas_item_ref: weakref.ReferenceType[RootCanvasItem]) -> None:
+                    root_canvas_item = root_canvas_item_ref()
+                    if root_canvas_item:
+                        root_canvas_item.canvas_widget.remove_section(section_id)
+
+                weakref.finalize(self, finalize, self.__root_canvas_item_ref)
+
+            def draw(self, drawing_context: DrawingContext.DrawingContext, canvas_rect: Geometry.IntRect) -> None:
+                root_canvas_item = self.__root_canvas_item_ref()
+                if root_canvas_item:
+                    root_canvas_item.canvas_widget.draw_section(self._section_id, drawing_context, canvas_rect)
+
+        RootCanvasItem.next_section_id += 1
+
+        return RootCanvasWidgetSection(self, RootCanvasItem.next_section_id)
 
     @property
     def root_container(self) -> typing.Optional[RootCanvasItem]:
@@ -3308,7 +3567,7 @@ class RootCanvasItem(CanvasWidgetCanvasItem):
         if width > 0 and height > 0:
             self._set_canvas_origin(Geometry.IntPoint())
             self._set_canvas_size(Geometry.IntSize(height=height, width=width))
-            self.refresh_layout()
+            self.update()
 
     @property
     def focused_item(self) -> typing.Optional[AbstractCanvasItem]:
@@ -3633,25 +3892,27 @@ class RootCanvasItem(CanvasWidgetCanvasItem):
         self.__canvas_widget.hide_tool_tip_text()
 
 
+class BackgroundCanvasItemComposer(BaseComposer):
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, composer_cache: ComposerCache, background_color: typing.Union[str, DrawingContext.LinearGradient]) -> None:
+        super().__init__(canvas_item, layout_sizing, composer_cache)
+        self.__background_color = background_color
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        with drawing_context.saver():
+            drawing_context.begin_path()
+            drawing_context.rect(canvas_bounds.left, canvas_bounds.top, canvas_bounds.width, canvas_bounds.height)
+            drawing_context.fill_style = self.__background_color
+            drawing_context.fill()
+
+
 class BackgroundCanvasItem(AbstractCanvasItem):
-
     """ Canvas item to draw background_color. """
-
     def __init__(self, background_color: typing.Optional[typing.Union[str, DrawingContext.LinearGradient]] = None) -> None:
         super().__init__()
-        self.background_color = background_color or "#888"
+        self.background_color = background_color
 
-    def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        # canvas size
-        canvas_size = self.canvas_size
-        if canvas_size:
-            canvas_width = canvas_size[1]
-            canvas_height = canvas_size[0]
-            with drawing_context.saver():
-                drawing_context.begin_path()
-                drawing_context.rect(0, 0, canvas_width, canvas_height)
-                drawing_context.fill_style = self.background_color
-                drawing_context.fill()
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        return BackgroundCanvasItemComposer(self, self.layout_sizing, composer_cache, self.background_color or "#888")
 
 
 @dataclasses.dataclass
@@ -3891,6 +4152,18 @@ class Cell(CellLike):
                 drawing_context.stroke()
 
 
+class CellCanvasItemComposer(BaseComposer):
+
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, cache: ComposerCache, cell: CellLike, style: typing.Set[str]) -> None:
+        super().__init__(canvas_item, layout_sizing, cache)
+        self.__cell = cell
+        self.__style = style
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        with drawing_context.saver():
+            self.__cell.paint_cell(drawing_context, canvas_bounds.to_float_rect(), self.__style)
+
+
 class CellCanvasItem(AbstractCanvasItem):
 
     """ Canvas item to draw and respond to user events for a cell.
@@ -3916,8 +4189,13 @@ class CellCanvasItem(AbstractCanvasItem):
         self.__cell_update_event_listener: typing.Optional[Event.EventListener] = None
         self.cell = cell
         self.style: typing.Set[str] = set()
+        # on_button_clicked is deprecated; use on_clicked instead
+        self.on_button_clicked: typing.Optional[typing.Callable[[], None]] = None
+        self.on_clicked: typing.Optional[typing.Callable[[], None]] = None
 
     def close(self) -> None:
+        self.on_button_clicked = None
+        self.on_clicked = None
         self.cell = None
         super().close()
 
@@ -4048,11 +4326,44 @@ class CellCanvasItem(AbstractCanvasItem):
         new_sizing = new_sizing.with_fixed_height(new_size.height + (padding.height * 2 if new_size.height else 0))
         self.update_sizing(new_sizing)
 
-    def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        rect = self.canvas_bounds
-        if self.__cell and rect is not None:
-            with drawing_context.saver():
-                self.__cell.paint_cell(drawing_context, rect.to_float_rect(), self.style)
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        if cell := self.cell:
+            return CellCanvasItemComposer(self, self.layout_sizing, composer_cache, cell, self.style)
+        return None
+
+    def mouse_entered(self) -> bool:
+        if self.wants_mouse_events:
+            self._mouse_inside = True
+            return True
+        return super().mouse_entered()
+
+    def mouse_exited(self) -> bool:
+        if self.wants_mouse_events:
+            self._mouse_inside = False
+            return True
+        return super().mouse_exited()
+
+    def mouse_pressed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
+        if self.wants_mouse_events:
+            self._mouse_pressed = True
+            return True
+        return super().mouse_pressed(x, y, modifiers)
+
+    def mouse_released(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
+        if self.wants_mouse_events:
+            self._mouse_pressed = False
+            return True
+        return super().mouse_released(x, y, modifiers)
+
+    def mouse_clicked(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
+        if self.wants_mouse_events:
+            if self.enabled:
+                if callable(self.on_button_clicked):
+                    self.on_button_clicked()
+                if callable(self.on_clicked):
+                    self.on_clicked()
+            return True
+        return super().mouse_clicked(x, y, modifiers)
 
 
 class TextButtonCell(Cell):
@@ -4172,38 +4483,6 @@ class TextButtonCanvasItem(TextCanvasItem):
                  border_color: typing.Optional[str] = None, padding: typing.Optional[Geometry.IntSize] = None) -> None:
         super().__init__(text, background_color, border_color, padding)
         self.wants_mouse_events = True
-        # on_button_clicked is deprecated; use on_clicked instead
-        self.on_button_clicked: typing.Optional[typing.Callable[[], None]] = None
-        self.on_clicked: typing.Optional[typing.Callable[[], None]] = None
-
-    def close(self) -> None:
-        self.on_button_clicked = None
-        self.on_clicked = None
-        super().close()
-
-    def mouse_entered(self) -> bool:
-        self._mouse_inside = True
-        return super().mouse_entered()
-
-    def mouse_exited(self) -> bool:
-        self._mouse_inside = False
-        return super().mouse_exited()
-
-    def mouse_pressed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        self._mouse_pressed = True
-        return True
-
-    def mouse_released(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        self._mouse_pressed = False
-        return True
-
-    def mouse_clicked(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        if self.enabled:
-            if self.on_button_clicked:
-                self.on_button_clicked()
-            if self.on_clicked:
-                self.on_clicked()
-        return True
 
 
 class TwistDownCell(Cell):
@@ -4243,36 +4522,8 @@ class TwistDownCell(Cell):
 class TwistDownCanvasItem(CellCanvasItem):
 
     def __init__(self) -> None:
-        super().__init__()
-        self.cell = TwistDownCell()
+        super().__init__(TwistDownCell())
         self.wants_mouse_events = True
-        self.on_button_clicked: typing.Optional[typing.Callable[[], None]] = None
-
-    def close(self) -> None:
-        self.on_button_clicked = None
-        super().close()
-
-    def mouse_entered(self) -> bool:
-        self._mouse_inside = True
-        return True
-
-    def mouse_exited(self) -> bool:
-        self._mouse_inside = False
-        return True
-
-    def mouse_pressed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        self._mouse_pressed = True
-        return True
-
-    def mouse_released(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        self._mouse_pressed = False
-        return True
-
-    def mouse_clicked(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        if self.enabled:
-            if callable(self.on_button_clicked):
-                self.on_button_clicked()
-        return True
 
 
 class BitmapCell(Cell):
@@ -4427,33 +4678,6 @@ class BitmapButtonCanvasItem(BitmapCanvasItem):
         bitmap = Bitmap.promote_bitmap(bitmap)
         super().__init__(bitmap=bitmap, background_color=background_color, border_color=border_color, padding=padding)
         self.wants_mouse_events = True
-        self.on_button_clicked: typing.Optional[typing.Callable[[], None]] = None
-
-    def close(self) -> None:
-        self.on_button_clicked = None
-        super().close()
-
-    def mouse_entered(self) -> bool:
-        self._mouse_inside = True
-        return True
-
-    def mouse_exited(self) -> bool:
-        self._mouse_inside = False
-        return True
-
-    def mouse_pressed(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        self._mouse_pressed = True
-        return True
-
-    def mouse_released(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        self._mouse_pressed = False
-        return True
-
-    def mouse_clicked(self, x: int, y: int, modifiers: UserInterface.KeyboardModifiers) -> bool:
-        if self.enabled:
-            if callable(self.on_button_clicked):
-                self.on_button_clicked()
-        return True
 
 
 class StaticTextCanvasItem(TextCanvasItem):
@@ -4469,6 +4693,73 @@ class StaticTextCanvasItem(TextCanvasItem):
     @font.setter
     def font(self, value: typing.Optional[str]) -> None:
         self.text_font = value
+
+
+class CheckBoxCanvasItemComposer(BaseComposer):
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, cache: ComposerCache,
+                    check_state: str, enabled: bool, mouse_inside: bool, mouse_pressed: bool,
+                    text: str, text_color: str, text_disabled_color: str, font: str) -> None:
+        super().__init__(canvas_item, layout_sizing, cache)
+        self.__check_state = check_state
+        self.__enabled = enabled
+        self.__mouse_inside = mouse_inside
+        self.__mouse_pressed = mouse_pressed
+        self.__text = text
+        self.__text_color = text_color
+        self.__text_disabled_color = text_disabled_color
+        self.__font = font
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        canvas_size = canvas_bounds.size
+        check_state = self.__check_state
+        enabled = self.__enabled
+        mouse_inside = self.__mouse_inside
+        mouse_pressed = self.__mouse_pressed
+        font = self.__font
+        text_color = self.__text_color
+        text_disabled_color = self.__text_disabled_color
+        text = self.__text
+        with drawing_context.saver():
+            drawing_context.translate(canvas_bounds.left, canvas_bounds.top)
+            drawing_context.begin_path()
+            tx = 4 + 14 + 4
+            cx = 4 + 7
+            cy = canvas_size.height * 0.5
+            size = 14
+            size_half = 7
+            drawing_context.round_rect(4, cy - size_half, size, size, 4.0)
+            if check_state in ("checked", "partial"):
+                drawing_context.fill_style = "#FFF"
+                drawing_context.fill()
+            if enabled and mouse_inside and mouse_pressed:
+                drawing_context.fill_style = "rgba(128, 128, 128, 0.5)"
+                drawing_context.fill()
+            elif enabled and mouse_inside:
+                drawing_context.fill_style = "rgba(128, 128, 128, 0.1)"
+                drawing_context.fill()
+            drawing_context.stroke_style = "#000"
+            drawing_context.line_width = 1.0
+            drawing_context.stroke()
+            if check_state == "checked":
+                drawing_context.begin_path()
+                drawing_context.move_to(cx - 3, cy - 2)
+                drawing_context.line_to(cx + 0, cy + 2)
+                drawing_context.line_to(cx + 8, cy - 9)
+                drawing_context.stroke_style = "#000"
+                drawing_context.line_width = 2.0
+                drawing_context.stroke()
+            elif check_state == "partial":
+                drawing_context.begin_path()
+                drawing_context.move_to(cx - 5, cy)
+                drawing_context.line_to(cx + 5, cy)
+                drawing_context.stroke_style = "#000"
+                drawing_context.line_width = 2.0
+                drawing_context.stroke()
+            drawing_context.font = font
+            drawing_context.text_align = 'left'
+            drawing_context.text_baseline = 'middle'
+            drawing_context.fill_style = text_color if enabled else text_disabled_color
+            drawing_context.fill_text(text, tx, cy + 1)
 
 
 class CheckBoxCanvasItem(AbstractCanvasItem):
@@ -4628,50 +4919,13 @@ class CheckBoxCanvasItem(AbstractCanvasItem):
         new_sizing = new_sizing.with_fixed_height(font_metrics.height + 2 * vertical_padding)
         self.update_sizing(new_sizing)
 
-    def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        canvas_size = self.canvas_size
-        if canvas_size:
-            with drawing_context.saver():
-                drawing_context.begin_path()
-                tx = 4 + 14 + 4
-                cx = 4 + 7
-                cy = canvas_size.height * 0.5
-                size = 14
-                size_half = 7
-                drawing_context.round_rect(4, cy - size_half, size, size, 4.0)
-                if self.check_state in ("checked", "partial"):
-                    drawing_context.fill_style = "#FFF"
-                    drawing_context.fill()
-                if self.enabled and self.__mouse_inside and self.__mouse_pressed:
-                    drawing_context.fill_style = "rgba(128, 128, 128, 0.5)"
-                    drawing_context.fill()
-                elif self.enabled and self.__mouse_inside:
-                    drawing_context.fill_style = "rgba(128, 128, 128, 0.1)"
-                    drawing_context.fill()
-                drawing_context.stroke_style = "#000"
-                drawing_context.line_width = 1.0
-                drawing_context.stroke()
-                if self.check_state == "checked":
-                    drawing_context.begin_path()
-                    drawing_context.move_to(cx - 3, cy - 2)
-                    drawing_context.line_to(cx + 0, cy + 2)
-                    drawing_context.line_to(cx + 8, cy - 9)
-                    drawing_context.stroke_style = "#000"
-                    drawing_context.line_width = 2.0
-                    drawing_context.stroke()
-                elif self.check_state == "partial":
-                    drawing_context.begin_path()
-                    drawing_context.move_to(cx - 5, cy)
-                    drawing_context.line_to(cx + 5, cy)
-                    drawing_context.stroke_style = "#000"
-                    drawing_context.line_width = 2.0
-                    drawing_context.stroke()
-                drawing_context.font = self.__font
-                drawing_context.text_align = 'left'
-                drawing_context.text_baseline = 'middle'
-                drawing_context.fill_style = self.__text_color if self.__enabled else self.__text_disabled_color
-                drawing_context.fill_text(self.__text, tx, cy + 1)
-        super()._repaint(drawing_context)
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        return CheckBoxCanvasItemComposer(self, self.layout_sizing, composer_cache, self.check_state, self.enabled, self.__mouse_inside, self.__mouse_pressed, self.__text, self.__text_color, self.__text_disabled_color, self.__font)
+
+
+class EmptyCanvasItemComposer(BaseComposer):
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        pass
 
 
 class EmptyCanvasItem(CellCanvasItem):
@@ -4680,6 +4934,9 @@ class EmptyCanvasItem(CellCanvasItem):
     def __init__(self, background_color: typing.Optional[typing.Union[str, DrawingContext.LinearGradient]] = None, border: typing.Optional[CellBorder] = None) -> None:
         super().__init__()
         self.cell = Cell(background_color, border)
+
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        return EmptyCanvasItemComposer(self, self.layout_sizing, composer_cache)
 
 
 class RadioButtonGroup:
@@ -4718,41 +4975,95 @@ class RadioButtonGroup:
             button.checked = index == self.__current_index
 
 
+class DrawCanvasItemComposer(BaseComposer):
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, composer_cache: ComposerCache, drawing_fn: typing.Callable[[DrawingContext.DrawingContext, Geometry.IntSize], None]) -> None:
+        super().__init__(canvas_item, layout_sizing, composer_cache)
+        self.__drawing_fn = drawing_fn
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        with drawing_context.saver():
+            drawing_context.translate(canvas_bounds.left, canvas_bounds.top)
+            self.__drawing_fn(drawing_context, canvas_bounds.size)
+
+
 class DrawCanvasItem(AbstractCanvasItem):
     def __init__(self, drawing_fn: typing.Callable[[DrawingContext.DrawingContext, Geometry.IntSize], None]) -> None:
         super().__init__()
         self.__drawing_fn = drawing_fn
 
-    def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        canvas_size = self.canvas_size
-        if canvas_size:
-            self.__drawing_fn(drawing_context, canvas_size)
-        super()._repaint(drawing_context)
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        return DrawCanvasItemComposer(self, self.layout_sizing, composer_cache, self.__drawing_fn)
+
+
+class DividerCanvasItemComposer(BaseComposer):
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, composer_cache: ComposerCache, orientation: str, color: str) -> None:
+        super().__init__(canvas_item, layout_sizing, composer_cache)
+        self.__orientation = orientation
+        self.__color = color
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        with drawing_context.saver():
+            if self.__orientation == "vertical":
+                drawing_context.move_to(canvas_bounds.center.x, canvas_bounds.top)
+                drawing_context.line_to(canvas_bounds.center.x, canvas_bounds.bottom)
+            else:
+                drawing_context.move_to(canvas_bounds.left, canvas_bounds.center.y)
+                drawing_context.line_to(canvas_bounds.right, canvas_bounds.center.y)
+            drawing_context.stroke_style = self.__color
+            drawing_context.stroke()
 
 
 class DividerCanvasItem(AbstractCanvasItem):
     def __init__(self, *, orientation: typing.Optional[str] = None, color: typing.Optional[str] = None):
         super().__init__()
         self.__orientation = orientation or "vertical"
-        if orientation == "vertical":
+        if self.__orientation == "vertical":
             self.update_sizing(self.sizing.with_fixed_width(2))
         else:
             self.update_sizing(self.sizing.with_fixed_height(2))
         self.__color = color or "#CCC"
 
-    def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        canvas_size = self.canvas_size
-        if canvas_size:
-            with drawing_context.saver():
-                if self.__orientation == "vertical":
-                    drawing_context.move_to(1, 0)
-                    drawing_context.line_to(1, canvas_size.height)
-                else:
-                    drawing_context.move_to(0, 1)
-                    drawing_context.line_to(canvas_size.width, 1)
-                drawing_context.stroke_style = self.__color
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        return DividerCanvasItemComposer(self, self.layout_sizing, composer_cache, self.__orientation, self.__color)
+
+
+class ProgressBarCanvasItemComposer(BaseComposer):
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, cache: ComposerCache, progress: float) -> None:
+        super().__init__(canvas_item, layout_sizing, cache)
+        self.__progress = progress
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        progress = self.__progress
+        canvas_size = canvas_bounds.size
+        canvas_bounds_center = canvas_bounds.center
+        with drawing_context.saver():
+            drawing_context.translate(canvas_bounds.left, canvas_bounds.top)
+            drawing_context.begin_path()
+            drawing_context.rect(0, 0, canvas_size.width, canvas_size.height)
+            drawing_context.close_path()
+            drawing_context.stroke_style = "#CCC"
+            drawing_context.fill_style = "#CCC"
+            drawing_context.fill()
+            drawing_context.stroke()
+            if canvas_size.width * progress >= 1:
+                drawing_context.begin_path()
+                drawing_context.rect(0, 0, canvas_size.width * progress, canvas_size.height)
+                drawing_context.close_path()
+                drawing_context.stroke_style = "#6AB"
+                drawing_context.fill_style = "#6AB"
+                drawing_context.fill()
                 drawing_context.stroke()
-        super()._repaint(drawing_context)
+            if canvas_size.height >= 16 and canvas_size.width * progress >= 50:  # TODO: use font metrics to find length of text
+                progress_text = str(round(progress * 100)) + "%"
+                drawing_context.begin_path()
+                drawing_context.font = "12px sans-serif"
+                drawing_context.text_align = 'center'
+                drawing_context.text_baseline = 'middle'
+                drawing_context.fill_style = "#fff"
+                drawing_context.line_width = 2
+                drawing_context.fill_text(progress_text, (canvas_size.width - 6) * progress - 19, canvas_bounds_center.y + 1)
+                drawing_context.fill()
+                drawing_context.close_path()
 
 
 class ProgressBarCanvasItem(AbstractCanvasItem):
@@ -4761,6 +5072,9 @@ class ProgressBarCanvasItem(AbstractCanvasItem):
         self.__enabled = True
         self.__progress = 0.0  # 0.0 to 1.0
         self.update_sizing(self.sizing.with_fixed_height(4))
+
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        return ProgressBarCanvasItemComposer(self, self.layout_sizing, composer_cache, self.__progress)
 
     @property
     def enabled(self) -> bool:
@@ -4780,39 +5094,18 @@ class ProgressBarCanvasItem(AbstractCanvasItem):
         self.__progress = min(max(value, 0.0), 1.0)
         self.update()
 
-    def _repaint(self, drawing_context: DrawingContext.DrawingContext) -> None:
-        canvas_bounds = self.canvas_bounds
-        if canvas_bounds:
-            canvas_size = canvas_bounds.size
-            canvas_bounds_center = canvas_bounds.center
+
+class TimestampCanvasItemComposer(BaseComposer):
+    def __init__(self, canvas_item: AbstractCanvasItem, layout_sizing: Sizing, cache: ComposerCache, timestamp_str: str) -> None:
+        super().__init__(canvas_item, layout_sizing, cache)
+        self.__timestamp_str = timestamp_str
+
+    def _repaint(self, drawing_context: DrawingContext.DrawingContext, canvas_bounds: Geometry.IntRect, composer_cache: ComposerCache) -> None:
+        timestamp_str = self.__timestamp_str
+        if timestamp_str:
             with drawing_context.saver():
-                drawing_context.begin_path()
-                drawing_context.rect(0, 0, canvas_size.width, canvas_size.height)
-                drawing_context.close_path()
-                drawing_context.stroke_style = "#CCC"
-                drawing_context.fill_style = "#CCC"
-                drawing_context.fill()
-                drawing_context.stroke()
-                if canvas_size.width * self.progress >= 1:
-                    drawing_context.begin_path()
-                    drawing_context.rect(0, 0, canvas_size.width * self.progress, canvas_size.height)
-                    drawing_context.close_path()
-                    drawing_context.stroke_style = "#6AB"
-                    drawing_context.fill_style = "#6AB"
-                    drawing_context.fill()
-                    drawing_context.stroke()
-                if canvas_size.height >= 16 and canvas_size.width * self.progress >= 50: # TODO: use font metrics to find length of text
-                    progress_text = str(round(self.progress * 100)) + "%"
-                    drawing_context.begin_path()
-                    drawing_context.font = "12px sans-serif"
-                    drawing_context.text_align = 'center'
-                    drawing_context.text_baseline = 'middle'
-                    drawing_context.fill_style = "#fff"
-                    drawing_context.line_width = 2
-                    drawing_context.fill_text(progress_text, (canvas_size.width - 6) * self.progress - 19, canvas_bounds_center.y + 1)
-                    drawing_context.fill()
-                    drawing_context.close_path()
-        super()._repaint(drawing_context)
+                drawing_context.translate(canvas_bounds.left, canvas_bounds.top)
+                drawing_context.timestamp(timestamp_str)
 
 
 class TimestampCanvasItem(AbstractCanvasItem):
@@ -4828,17 +5121,20 @@ class TimestampCanvasItem(AbstractCanvasItem):
 
     @timestamp_ns.setter
     def timestamp_ns(self, value: int) -> None:
-        self.__timestamp_ns = value
-        self.__used_timestamp_ns = value
+        if value != self.__timestamp_ns or value != self.__used_timestamp_ns:
+            self.__timestamp_ns = value
+            self.__used_timestamp_ns = value
+            self._invalidate_composer()
 
-    def _repaint_if_needed(self, drawing_context: DrawingContext.DrawingContext, *, immediate: bool = False) -> None:
+    def _get_composer(self, composer_cache: ComposerCache) -> typing.Optional[BaseComposer]:
+        timestamp_str = str()
         if self.__used_timestamp_ns:
-            drawing_context.timestamp(str(self.__used_timestamp_ns))
+            timestamp_str = str(self.__used_timestamp_ns)
             self.__used_timestamp = 0
         elif self.__timestamp_ns:
             # tell host to use last timestamp it knows about.
-            drawing_context.timestamp("last")
-        super()._repaint_if_needed(drawing_context)
+            timestamp_str = "last"
+        return TimestampCanvasItemComposer(self, self.layout_sizing, composer_cache, timestamp_str)
 
 
 def load_rgba_data_from_bytes(b: typing.ByteString, format: typing.Optional[str] = None) -> typing.Optional[DrawingContext.RGBA32Type]:
